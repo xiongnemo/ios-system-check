@@ -1742,6 +1742,127 @@ test_metal_cull(MetalTest *t)
 	}
 }
 
+/* blend colour: white blended with factor BlendColor against zero, so the target is the encoder's blend colour */
+static void
+test_metal_blendcolor(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	NSString *problem = nil;
+	unsigned wrong = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (!render_ours(@"v_fullscreen", @"f_solid", MTLClearColorMake(0, 0, 0, 1), ^(MTLRenderPipelineDescriptor *p) {
+		    p.colorAttachments[0].blendingEnabled = YES;
+		    p.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorBlendColor;
+		    p.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorZero;
+		    p.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorBlendAlpha;
+		    p.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
+	    }, nil, ^(id<MTLRenderCommandEncoder> e) {
+		    const float white[4] = { 1, 1, 1, 1 };
+
+		    [e setBlendColorRed:0.25f green:0.5f blue:0.75f alpha:1.0f];
+		    [e setFragmentBytes:white length:sizeof(white) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	    }, px, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	for (unsigned i = 0; i < SIDE * SIDE; i++) {
+		wrong += !px_near(px + i * 4, 191, 128, 64, 255, 2);
+	}
+	if (wrong == 0) {
+		[t pass:@"every pixel the blend colour, B G R A 191 128 64 255"];
+	} else {
+		[t fail:@"%u pixels wrong; %@ (B G R A 191 128 64 255 wanted)", wrong, px_text(px, SIDE / 2, SIDE / 2)];
+	}
+}
+
+/* indirect: the full-screen triangle drawn from MTLDrawPrimitivesIndirectArguments in a buffer, green; then a red
+   one whose arguments say no instances, which must draw nothing */
+static void
+test_metal_indirect(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	NSString *problem = nil;
+	unsigned wrong = 0;
+	const uint32_t args[8] = { 3, 1, 0, 0, /* (none:) */ 3, 0, 0, 0 };
+	id<MTLBuffer> buffer;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	buffer = [g_device newBufferWithBytes:args length:sizeof(args) options:MTLResourceStorageModeShared];
+	if (!render_ours(@"v_fullscreen", @"f_solid", MTLClearColorMake(0, 0, 0, 1), nil, nil,
+	    ^(id<MTLRenderCommandEncoder> e) {
+		    const float green[4] = { 0, 1, 0, 1 }, red[4] = { 1, 0, 0, 1 };
+
+		    [e setFragmentBytes:green length:sizeof(green) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:buffer indirectBufferOffset:0];
+		    [e setFragmentBytes:red length:sizeof(red) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:buffer indirectBufferOffset:16];
+	    }, px, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	for (unsigned i = 0; i < SIDE * SIDE; i++) {
+		wrong += !px_near(px + i * 4, 0, 255, 0, 255, 1);
+	}
+	if (wrong == 0) {
+		[t pass:@"green everywhere from the buffer's arguments; the no-instances draw drew nothing"];
+	} else {
+		[t fail:@"%u pixels wrong; %@ (green wanted)", wrong, px_text(px, SIDE / 2, SIDE / 2)];
+	}
+}
+
+static BOOL dispatch_ours(id<MTLFunction> function, NSUInteger n, NSUInteger group,
+    void (^bind)(id<MTLComputeCommandEncoder>), NSString **problem);    /* (with the compute tests, below) */
+
+/* heap: a buffer from an MTLHeap, written by k_iota and read back */
+static void
+test_metal_heap(MetalTest *t)
+{
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	id<MTLHeap> heap;
+	id<MTLBuffer> buffer;
+	NSString *problem = nil;
+	unsigned wrong = 0;
+	const uint32_t *v;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	d.size = 1 << 20;
+	d.storageMode = MTLStorageModeShared;
+	if ((heap = [g_device newHeapWithDescriptor:d]) == nil) {
+		[t fail:@"-newHeapWithDescriptor: gave nil"];
+		return;
+	}
+	if ((buffer = [heap newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared]) == nil) {
+		[t fail:@"the heap gave no buffer"];
+		return;
+	}
+	memset(buffer.contents, 0xff, 256 * 4);
+	if (!dispatch_ours([g_ours newFunctionWithName:@"k_iota"], 256, 64, ^(id<MTLComputeCommandEncoder> e) {
+		    [e useHeap:heap];
+		    [e setBuffer:buffer offset:0 atIndex:0];
+	    }, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	v = buffer.contents;
+	for (unsigned i = 0; i < 256; i++) {
+		wrong += v[i] != 3 * i + 1;
+	}
+	if (wrong == 0) {
+		[t pass:@"a buffer of a %lu KB heap written on the GPU, every value right (heap used %lu bytes)",
+		    (unsigned long)(heap.size >> 10), (unsigned long)heap.usedSize];
+	} else {
+		[t fail:@"%u of 256 wrong; d[1] %u (wanted 4)", wrong, v[1]];
+	}
+}
+
 /* depth: a near red triangle first, then a far blue one over the whole target -- red stays where both are */
 static void
 test_metal_depth(MetalTest *t)
@@ -2627,6 +2748,9 @@ static const struct {
 	{ "metal.viewport", test_metal_viewport },
 	{ "metal.scissor", test_metal_scissor },
 	{ "metal.cull", test_metal_cull },
+	{ "metal.blendcolor", test_metal_blendcolor },
+	{ "metal.indirect", test_metal_indirect },
+	{ "metal.heap", test_metal_heap },
 	{ "metal.depth", test_metal_depth },
 	{ "metal.msaa", test_metal_msaa },
 	{ "metal.iota", test_metal_iota },
