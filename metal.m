@@ -2123,6 +2123,11 @@ test_metal_event(MetalTest *t)
 	d = [g_device newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
 	memset(d.contents, 0xff, 256 * 4);
 	listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create("metal.event", NULL)];
+	if (listener == nil) {
+		/* (Metal's own initialiser registers with the GPU's kernel service, and a port without that answers nil) */
+		[t fail:@"MTLSharedEventListener -initWithDispatchQueue: gave nil"];
+		return;
+	}
 	[event notifyListener:listener atValue:1 block:^(id<MTLSharedEvent> e, uint64_t value) {
 		const uint32_t *v = d.contents;
 		unsigned bad = 0;
