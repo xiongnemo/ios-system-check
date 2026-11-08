@@ -14,6 +14,10 @@ void gpu_run(void);
 void metal_run(void);
 void video_run(void);
 
+/* Whether the GPU tab has made an SKView / SCNView in this process (gpu.m sets them). SpriteKit and SceneKit pick
+   OpenGL ES or Metal once a process, so the Metal tab's spritekit and scenekit tests mean something only before. */
+extern BOOL check_gl_spritekit_used, check_gl_scenekit_used;
+
 /*
  * The process's one crash handler, shared by the tabs that keep a log of what they ran: on a fatal signal each
  * on_signal is called (it may only write(2) and fsync(2), to descriptors opened before), then the signal takes the

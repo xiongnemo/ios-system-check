@@ -35,6 +35,8 @@
 #include <unistd.h>
 #import "check.h"
 
+BOOL check_gl_spritekit_used, check_gl_scenekit_used;   /* (check.h) */
+
 /* (preferredFramesPerSecond and the like: deprecated, and tested on purpose) */
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -3593,6 +3595,7 @@ scn_api_name(SCNRenderingAPI api)
 		return;
 	}
 	_view = [[SCNView alloc] initWithFrame:window.bounds options:_options];
+	check_gl_scenekit_used = YES;
 	_view.backgroundColor = UIColor.blackColor;
 	_view.scene = [self scene];
 	_view.pointOfView = [_view.scene.rootNode childNodesPassingTest:^BOOL(SCNNode *child, BOOL *stop) {
@@ -3738,6 +3741,7 @@ t_scenekit_default(Test *t)
 		return;
 	}
 	_view = [[SKView alloc] initWithFrame:window.bounds];
+	check_gl_spritekit_used = YES;
 	_view.showsFPS = YES;
 	_view.showsNodeCount = YES;
 	[window addSubview:_view];
@@ -3806,6 +3810,7 @@ t_spritekit_texture(Test *t)
 		return;
 	}
 	view = [[SKView alloc] initWithFrame:CGRectMake(0, 0, 100, 100)];
+	check_gl_spritekit_used = YES;
 	scene = [SKScene sceneWithSize:CGSizeMake(100, 100)];
 	sprite = [SKSpriteNode spriteNodeWithColor:UIColor.magentaColor size:CGSizeMake(32, 32)];
 	sprite.position = CGPointMake(50, 50);

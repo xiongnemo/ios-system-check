@@ -1650,6 +1650,97 @@ test_metal_viewport(MetalTest *t)
 	}
 }
 
+/* scissor: the full-screen triangle through a scissor of the top left quarter -- green there only */
+static void
+test_metal_scissor(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	NSString *problem = nil;
+	unsigned wrong = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if (!render_ours(@"v_fullscreen", @"f_solid", MTLClearColorMake(0, 0, 0, 1), nil, nil,
+	    ^(id<MTLRenderCommandEncoder> e) {
+		    const float colour[4] = { 0, 1, 0, 1 };
+		    MTLScissorRect quarter = { 0, 0, SIDE / 2, SIDE / 2 };
+
+		    [e setScissorRect:quarter];
+		    [e setFragmentBytes:colour length:sizeof(colour) atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	    }, px, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			BOOL in = x < SIDE / 2 && y < SIDE / 2;
+
+			wrong += !px_near(px + (y * SIDE + x) * 4, 0, in ? 255 : 0, 0, 255, 1);
+		}
+	}
+	if (wrong == 0) {
+		[t pass:@"green in the top left quarter only"];
+	} else {
+		[t fail:@"%u of %u pixels wrong; %@ (green wanted), %@ (black wanted)", wrong, SIDE * SIDE, px_text(px, 8, 8),
+		    px_text(px, SIDE - 8, SIDE - 8)];
+	}
+}
+
+/*
+ * cull mode and winding: a red triangle on the left whose corners run counter-clockwise (Metal's y up) and a green
+ * one on the right running clockwise, front faces counter-clockwise. Culling back faces keeps the red one only;
+ * culling front faces the green one only. (Metal's winding is GL's sense: a mesh wound counter-clockwise, drawn with
+ * counter-clockwise front faces and back faces culled, is what Apple's own samples draw.)
+ */
+static void
+test_metal_cull(MetalTest *t)
+{
+	static unsigned char px[2][SIDE * SIDE * 4];
+	NSString *problem = nil;
+	const NSUInteger modes[2] = { MTLCullModeBack, MTLCullModeFront };
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	for (unsigned m = 0; m < 2; m++) {
+		const NSUInteger mode = modes[m];
+
+		if (!render_ours(@"v_colored", @"f_color", MTLClearColorMake(0, 0, 1, 1), nil, nil,
+		    ^(id<MTLRenderCommandEncoder> e) {
+			    const float v[6][8] = {
+				    /* left, counter-clockwise: bottom left, bottom right, top */
+				    { -0.9f, -0.5f, 0, 1, 1, 0, 0, 1 }, { -0.1f, -0.5f, 0, 1, 1, 0, 0, 1 },
+				    { -0.5f, 0.5f, 0, 1, 1, 0, 0, 1 },
+				    /* right, clockwise: bottom left, top, bottom right */
+				    { 0.1f, -0.5f, 0, 1, 0, 1, 0, 1 }, { 0.5f, 0.5f, 0, 1, 0, 1, 0, 1 },
+				    { 0.9f, -0.5f, 0, 1, 0, 1, 0, 1 },
+			    };
+
+			    [e setFrontFacingWinding:MTLWindingCounterClockwise];
+			    [e setCullMode:mode];
+			    [e setVertexBytes:v length:sizeof(v) atIndex:0];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		    }, px[m], &problem)) {
+			[t fail:@"%@", problem];
+			return;
+		}
+	}
+	/* (BGRA; the triangles' middles at (16, 37) and (48, 37)) */
+	BOOL back_ok = px_near(px[0] + (37 * SIDE + 16) * 4, 0, 0, 255, 255, 1) &&
+	    px_near(px[0] + (37 * SIDE + 48) * 4, 255, 0, 0, 255, 1);
+	BOOL front_ok = px_near(px[1] + (37 * SIDE + 16) * 4, 255, 0, 0, 255, 1) &&
+	    px_near(px[1] + (37 * SIDE + 48) * 4, 0, 255, 0, 255, 1);
+
+	if (back_ok && front_ok) {
+		[t pass:@"back faces culled: the red (counter-clockwise) kept; front faces culled: the green kept"];
+	} else {
+		[t fail:@"cull back: left %@ right %@ (red, blue wanted); cull front: left %@ right %@ (blue, green wanted)",
+		    px_text(px[0], 16, 37), px_text(px[0], 48, 37), px_text(px[1], 16, 37), px_text(px[1], 48, 37)];
+	}
+}
+
 /* depth: a near red triangle first, then a far blue one over the whole target -- red stays where both are */
 static void
 test_metal_depth(MetalTest *t)
@@ -1941,6 +2032,216 @@ test_metal_gradient(MetalTest *t)
 	}
 }
 
+/* one 2D dispatch of our kernel over w x h threads in 8x8 groups (v2's kernels, which take k_gradient apart) */
+static BOOL
+dispatch_ours2d(NSString *name, NSUInteger w, NSUInteger h, void (^bind)(id<MTLComputeCommandEncoder>), NSString **problem)
+{
+	NSError *error = nil;
+	id<MTLFunction> function = [g_ours newFunctionWithName:name];
+	id<MTLComputePipelineState> pipeline;
+	id<MTLCommandBuffer> buffer;
+	id<MTLComputeCommandEncoder> encoder;
+
+	if (function == nil) {
+		*problem = [NSString stringWithFormat:@"no %@ in alioth-tests.metallib (v2 has it)", name];
+		return NO;
+	}
+	if ((pipeline = [g_device newComputePipelineStateWithFunction:function error:&error]) == nil) {
+		*problem = [NSString stringWithFormat:@"%@: no compute pipeline: %@", name,
+		    error.localizedDescription ?: @"nil, no error"];
+		return NO;
+	}
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	if ((encoder = [buffer computeCommandEncoder]) == nil) {
+		*problem = @"no compute encoder";
+		return NO;
+	}
+	[encoder setComputePipelineState:pipeline];
+	bind(encoder);
+	[encoder dispatchThreadgroups:MTLSizeMake((w + 7) / 8, (h + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+	[encoder endEncoding];
+	return finish(buffer, problem);
+}
+
+static id<MTLTexture>
+texture_ours(MTLPixelFormat format, NSUInteger w, NSUInteger h)
+{
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h
+	    mipmapped:NO];
+
+	d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+	return [g_device newTextureWithDescriptor:d];
+}
+
+/* texels of a 16x16 RGBA8 gradient (k_gradient's) that are off by more than 1; the first one in *first */
+static unsigned
+gradient8_wrong(const unsigned char *out, NSString **first)
+{
+	unsigned wrong = 0;
+
+	for (unsigned y = 0; y < 16; y++) {
+		for (unsigned x = 0; x < 16; x++) {
+			const unsigned char *p = out + (y * 16 + x) * 4;
+			long r = lroundf(x * 255.0f / 15), g = lroundf(y * 255.0f / 15);
+
+			if (labs(p[0] - r) > 1 || labs(p[1] - g) > 1 || abs(p[2] - 128) > 1 || p[3] != 255) {
+				if (wrong++ == 0) {
+					*first = [NSString stringWithFormat:@"(%u,%u) R G B A %u %u %u %u, wanted %ld %ld 128 255", x, y,
+					    p[0], p[1], p[2], p[3], r, g];
+				}
+			}
+		}
+	}
+	return wrong;
+}
+
+/* k_sizes, k_sizes_rw, k_sizes_ro: what get_width / get_height answer on a 16x12 texture, for each way of holding it */
+static void
+test_metal_sizes(MetalTest *t)
+{
+	static NSString *const kernels[] = { @"k_sizes", @"k_sizes_rw", @"k_sizes_ro" };
+	static const char *const how[] = { "write", "read_write", "read" };
+	NSMutableString *got = [NSMutableString string];
+	unsigned bad = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	for (unsigned k = 0; k < 3; k++) {
+		id<MTLTexture> texture = texture_ours(MTLPixelFormatRGBA8Unorm, 16, 12);
+		id<MTLBuffer> d = [g_device newBufferWithLength:8 options:MTLResourceStorageModeShared];
+		NSString *problem = nil;
+		const uint32_t *v = d.contents;
+
+		memset(d.contents, 0xee, 8);
+		if (!dispatch_ours2d(kernels[k], 16, 12, ^(id<MTLComputeCommandEncoder> e) {
+			    [e setTexture:texture atIndex:0];
+			    [e setBuffer:d offset:0 atIndex:0];
+		    }, &problem)) {
+			[got appendFormat:@"%s%s: %@", got.length ? "; " : "", how[k], problem];
+			bad++;
+			continue;
+		}
+		bad += v[0] != 16 || v[1] != 12;
+		[got appendFormat:@"%s%s %ux%u", got.length ? "; " : "", how[k], v[0], v[1]];
+	}
+	if (bad == 0) {
+		[t pass:@"16x12 every way: %@", got];
+	} else {
+		[t fail:@"%@ (wanted 16x12; 0xeeeeeeee: not written)", got];
+	}
+}
+
+/* k_gradient_n: the size from a buffer, no queries; into RGBA8Unorm (converted) and RGBA32Float (not) */
+static void
+test_metal_gradient_n(MetalTest *t)
+{
+	const uint32_t n[2] = { 16, 16 };
+	id<MTLBuffer> size;
+	id<MTLTexture> t8, t32;
+	NSString *problem = nil, *first = nil;
+	unsigned char out8[16 * 16 * 4];
+	float out32[16 * 16 * 4];
+	unsigned wrong8, wrong32 = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	size = [g_device newBufferWithBytes:n length:sizeof(n) options:MTLResourceStorageModeShared];
+	t8 = texture_ours(MTLPixelFormatRGBA8Unorm, 16, 16);
+	t32 = texture_ours(MTLPixelFormatRGBA32Float, 16, 16);
+	if (!dispatch_ours2d(@"k_gradient_n", 16, 16, ^(id<MTLComputeCommandEncoder> e) {
+		    [e setTexture:t8 atIndex:0];
+		    [e setBuffer:size offset:0 atIndex:0];
+	    }, &problem) || !dispatch_ours2d(@"k_gradient_n", 16, 16, ^(id<MTLComputeCommandEncoder> e) {
+		    [e setTexture:t32 atIndex:0];
+		    [e setBuffer:size offset:0 atIndex:0];
+	    }, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	[t8 getBytes:out8 bytesPerRow:16 * 4 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+	[t32 getBytes:out32 bytesPerRow:16 * 16 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+	wrong8 = gradient8_wrong(out8, &first);
+	for (unsigned i = 0; i < 16 * 16; i++) {
+		const float *p = out32 + i * 4;
+
+		wrong32 += fabsf(p[0] - (i % 16) / 15.0f) > 1e-5f || fabsf(p[1] - (i / 16) / 15.0f) > 1e-5f || p[2] != 0.5f ||
+		    p[3] != 1.0f;
+	}
+	if (wrong8 == 0 && wrong32 == 0) {
+		[t pass:@"RGBA8Unorm and RGBA32Float, every texel right"];
+	} else {
+		[t fail:@"RGBA8Unorm %u of 256 wrong%@%@; RGBA32Float %u of 256 wrong, (15,15) %g %g %g %g (wanted 1 1 0.5 1)", wrong8,
+		    first != nil ? @", first " : @"", first ?: @"", wrong32, out32[255 * 4], out32[255 * 4 + 1], out32[255 * 4 + 2],
+		    out32[255 * 4 + 3]];
+	}
+}
+
+/* k_gradient16: halves stored into RGBA8Unorm, converted by the texture's format */
+static void
+test_metal_gradient16(MetalTest *t)
+{
+	const uint32_t n[2] = { 16, 16 };
+	id<MTLBuffer> size;
+	id<MTLTexture> texture;
+	NSString *problem = nil, *first = nil;
+	unsigned char out[16 * 16 * 4];
+	unsigned wrong;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	size = [g_device newBufferWithBytes:n length:sizeof(n) options:MTLResourceStorageModeShared];
+	texture = texture_ours(MTLPixelFormatRGBA8Unorm, 16, 16);
+	if (!dispatch_ours2d(@"k_gradient16", 16, 16, ^(id<MTLComputeCommandEncoder> e) {
+		    [e setTexture:texture atIndex:0];
+		    [e setBuffer:size offset:0 atIndex:0];
+	    }, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	[texture getBytes:out bytesPerRow:16 * 4 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+	if ((wrong = gradient8_wrong(out, &first)) == 0) {
+		[t pass:@"every texel converted from half to RGBA8 right"];
+	} else {
+		[t fail:@"%u of 256 texels wrong, first %@", wrong, first];
+	}
+}
+
+/* k_store_uint: integers into RGBA8Uint, (x, y, 7, 255) */
+static void
+test_metal_store_uint(MetalTest *t)
+{
+	id<MTLTexture> texture;
+	NSString *problem = nil;
+	unsigned char out[16 * 16 * 4];
+	unsigned wrong = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	texture = texture_ours(MTLPixelFormatRGBA8Uint, 16, 16);
+	if (!dispatch_ours2d(@"k_store_uint", 16, 16, ^(id<MTLComputeCommandEncoder> e) {
+		    [e setTexture:texture atIndex:0];
+	    }, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	[texture getBytes:out bytesPerRow:16 * 4 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+	for (unsigned i = 0; i < 16 * 16; i++) {
+		const unsigned char *p = out + i * 4;
+
+		wrong += p[0] != i % 16 || p[1] != i / 16 || p[2] != 7 || p[3] != 255;
+	}
+	if (wrong == 0) {
+		[t pass:@"every texel (x, y, 7, 255)"];
+	} else {
+		[t fail:@"%u of 256 texels wrong; (5,3) %u %u %u %u (wanted 5 3 7 255)", wrong, out[(3 * 16 + 5) * 4],
+		    out[(3 * 16 + 5) * 4 + 1], out[(3 * 16 + 5) * 4 + 2], out[(3 * 16 + 5) * 4 + 3]];
+	}
+}
+
 /* k_reduce: 256 values summed through threadgroup memory and barriers (groups of 64), added atomically */
 static void
 test_metal_reduce(MetalTest *t)
@@ -2067,47 +2368,76 @@ test_metal_blit(MetalTest *t)
 	}
 }
 
-/* SpriteKit on this device: an SKView's textureFromNode: renders a magenta sprite, read back from its CGImage */
+/*
+ * SpriteKit on this device: SKRenderer, given it, draws a magenta square in the middle of a black 64x64 target, read
+ * back. (Not an SKView: that takes MTLCreateSystemDefaultDevice()'s device, which is nil until the system itself finds
+ * this driver, and then draws with OpenGL ES -- the GPU tab's spritekit.* tests.)
+ */
 static void
 test_metal_spritekit(MetalTest *t)
 {
-	SKView *view;
+	SKRenderer *renderer;
 	SKScene *scene;
 	SKSpriteNode *sprite;
-	SKTexture *texture;
-	CGImageRef image;
-	unsigned char pixel[4] = { 0 };
-	CGContextRef context;
-	CGColorSpaceRef rgb;
+	MTLTextureDescriptor *d;
+	MTLRenderPassDescriptor *pass;
+	id<MTLTexture> target;
+	id<MTLCommandBuffer> buffer;
+	NSString *problem = nil;
+	static unsigned char px[SIDE * SIDE * 4];
 
 	if (g_device == nil) {
 		[t skip:@"no device"];
 		return;
 	}
-	if (NSClassFromString(@"SKView") == nil) {
+	if (NSClassFromString(@"SKRenderer") == nil) {
 		[t skip:@"no SpriteKit"];
 		return;
 	}
-	view = [[SKView alloc] initWithFrame:CGRectMake(0, 0, 64, 64)];
-	scene = [SKScene sceneWithSize:CGSizeMake(64, 64)];
-	sprite = [SKSpriteNode spriteNodeWithColor:UIColor.magentaColor size:CGSizeMake(32, 32)];
-	sprite.position = CGPointMake(32, 32);
-	[scene addChild:sprite];
-	[view presentScene:scene];
-	if ((texture = [view textureFromNode:sprite]) == nil || (image = texture.CGImage) == NULL) {
-		[t fail:@"textureFromNode: %@", texture == nil ? @"nil" : @"no CGImage"];
+	if (check_gl_spritekit_used) {
+		/* SpriteKit settles once a process; its textures are GL ones now, whatever device an SKRenderer gets */
+		[t skip:@"the GPU tab's SKViews ran first in this process, on OpenGL ES; run the Metal tab first"];
 		return;
 	}
-	rgb = CGColorSpaceCreateDeviceRGB();
-	context = CGBitmapContextCreate(pixel, 1, 1, 8, 4, rgb, kCGImageAlphaPremultipliedLast);
-	CGContextDrawImage(context, CGRectMake(-(CGFloat)CGImageGetWidth(image) / 2, -(CGFloat)CGImageGetHeight(image) / 2,
-	    CGImageGetWidth(image), CGImageGetHeight(image)), image);
-	CGContextRelease(context);
-	CGColorSpaceRelease(rgb);
-	if (pixel[0] > 200 && pixel[1] < 60 && pixel[2] > 200) {
-		[t pass:@"SpriteKit drew through this device: magenta, R G B %u %u %u", pixel[0], pixel[1], pixel[2]];
+	if ((renderer = [SKRenderer rendererWithDevice:g_device]) == nil) {
+		[t fail:@"+[SKRenderer rendererWithDevice:] gave nil"];
+		return;
+	}
+	d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:SIDE height:SIDE
+	    mipmapped:NO];
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	if ((target = [g_device newTextureWithDescriptor:d]) == nil) {
+		[t fail:@"no BGRA8 target"];
+		return;
+	}
+	scene = [SKScene sceneWithSize:CGSizeMake(SIDE, SIDE)];
+	scene.backgroundColor = UIColor.blackColor;
+	sprite = [SKSpriteNode spriteNodeWithColor:UIColor.magentaColor size:CGSizeMake(SIDE / 2, SIDE / 2)];
+	sprite.position = CGPointMake(SIDE / 2, SIDE / 2);
+	[scene addChild:sprite];
+	renderer.scene = scene;
+	[renderer updateAtTime:CACurrentMediaTime()];
+	pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	/* black: an SKRenderer draws the nodes and leaves the background to the pass's own clear (d70b004's round: the
+	   corner came back as the clear colour, not the scene's backgroundColor) */
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	[renderer renderWithViewport:CGRectMake(0, 0, SIDE, SIDE) commandBuffer:buffer renderPassDescriptor:pass];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	[target getBytes:px bytesPerRow:SIDE * 4 fromRegion:MTLRegionMake2D(0, 0, SIDE, SIDE) mipmapLevel:0];
+	/* (BGRA: the middle magenta, a corner the scene's black) */
+	if (px_near(px + (SIDE / 2 * SIDE + SIDE / 2) * 4, 255, 0, 255, 255, 40) && px_near(px + (4 * SIDE + 4) * 4, 0, 0, 0, 255,
+	    40)) {
+		[t pass:@"SKRenderer on this device drew the scene: the middle magenta, a corner black"];
 	} else {
-		[t fail:@"the sprite came back R G B A %u %u %u %u (magenta wanted)", pixel[0], pixel[1], pixel[2], pixel[3]];
+		[t fail:@"the middle %@, a corner %@ (B G R A: magenta and black wanted)", px_text(px, SIDE / 2, SIDE / 2),
+		    px_text(px, 4, 4)];
 	}
 }
 
@@ -2136,7 +2466,12 @@ test_metal_scenekit(MetalTest *t)
 	[t note:@"renderingAPI %@, device %@", view.renderingAPI == SCNRenderingAPIMetal ? @"Metal" : @"OpenGL ES",
 	    view.device.name ?: @"none"];
 	if (view.renderingAPI != SCNRenderingAPIMetal) {
-		[t fail:@"SceneKit took OpenGL ES though Metal was asked for"];
+		if (check_gl_scenekit_used) {
+			[t skip:@"SceneKit took OpenGL ES: the GPU tab's SCNViews ran first in this process, and SceneKit settles "
+			    @"once; run the Metal tab first"];
+		} else {
+			[t fail:@"SceneKit took OpenGL ES though Metal was asked for"];
+		}
 		return;
 	}
 	scene = [SCNScene scene];
@@ -2195,11 +2530,17 @@ static const struct {
 	{ "metal.texture", test_metal_texture },
 	{ "metal.blend", test_metal_blend },
 	{ "metal.viewport", test_metal_viewport },
+	{ "metal.scissor", test_metal_scissor },
+	{ "metal.cull", test_metal_cull },
 	{ "metal.depth", test_metal_depth },
 	{ "metal.msaa", test_metal_msaa },
 	{ "metal.iota", test_metal_iota },
 	{ "metal.add", test_metal_add },
 	{ "metal.gradient", test_metal_gradient },
+	{ "metal.sizes", test_metal_sizes },
+	{ "metal.gradient.n", test_metal_gradient_n },
+	{ "metal.gradient16", test_metal_gradient16 },
+	{ "metal.store.uint", test_metal_store_uint },
 	{ "metal.reduce", test_metal_reduce },
 	{ "metal.constants", test_metal_constants },
 	{ "metal.blit", test_metal_blit },
