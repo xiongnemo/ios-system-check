@@ -2089,6 +2089,78 @@ dispatch_ours(id<MTLFunction> function, NSUInteger n, NSUInteger group, void (^b
 	return finish(buffer, problem);
 }
 
+/*
+ * events: k_iota into a buffer, then -encodeSignalEvent:value:1 in the same command buffer. The value is not set
+ * before the commit, a listener hears 1, and when it does the kernel's numbers are already in the buffer (what a
+ * renderer that waits for an event before reusing its buffers relies on).
+ */
+static void
+test_metal_event(MetalTest *t)
+{
+	id<MTLSharedEvent> event;
+	id<MTLBuffer> d;
+	id<MTLComputePipelineState> pipeline;
+	id<MTLCommandBuffer> buffer;
+	id<MTLComputeCommandEncoder> encoder;
+	MTLSharedEventListener *listener;
+	NSError *error = nil;
+	CFAbsoluteTime began;
+	__block uint64_t heard = 0;
+	__block unsigned wrong = 0;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if ((event = [g_device newSharedEvent]) == nil) {
+		[t fail:@"-newSharedEvent gave nil"];
+		return;
+	}
+	if ((pipeline = [g_device newComputePipelineStateWithFunction:[g_ours newFunctionWithName:@"k_iota"]
+	    error:&error]) == nil) {
+		[t fail:@"no compute pipeline: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	d = [g_device newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
+	memset(d.contents, 0xff, 256 * 4);
+	listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create("metal.event", NULL)];
+	[event notifyListener:listener atValue:1 block:^(id<MTLSharedEvent> e, uint64_t value) {
+		const uint32_t *v = d.contents;
+		unsigned bad = 0;
+
+		(void)e;
+		for (unsigned i = 0; i < 256; i++) {
+			bad += v[i] != 3 * i + 1;
+		}
+		wrong = bad;
+		__atomic_store_n(&heard, value, __ATOMIC_RELEASE);
+	}];
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	encoder = [buffer computeCommandEncoder];
+	[encoder setComputePipelineState:pipeline];
+	[encoder setBuffer:d offset:0 atIndex:0];
+	[encoder dispatchThreadgroups:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[encoder endEncoding];
+	[buffer encodeSignalEvent:event value:1];
+	if (event.signaledValue != 0) {
+		[t fail:@"the value was %llu before the commit", (unsigned long long)event.signaledValue];
+		return;
+	}
+	[buffer commit];
+	began = CFAbsoluteTimeGetCurrent();
+	while (__atomic_load_n(&heard, __ATOMIC_ACQUIRE) == 0 && CFAbsoluteTimeGetCurrent() - began < 2.0) {
+		[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+	}
+	if (__atomic_load_n(&heard, __ATOMIC_ACQUIRE) != 1) {
+		[t fail:@"the listener heard %llu in 2 s (1 wanted); signaledValue %llu", (unsigned long long)heard,
+		    (unsigned long long)event.signaledValue];
+	} else if (wrong != 0) {
+		[t fail:@"the listener heard 1 with %u of 256 values not yet written: set before the GPU was done", wrong];
+	} else {
+		[t pass:@"set after the commit, heard as 1 in %.1f ms, the kernel's 256 values already there",
+		    (CFAbsoluteTimeGetCurrent() - began) * 1000];
+	}
+}
+
 /* k_iota: d[i] = 3i + 1 over 256 threads, nothing in */
 static void
 test_metal_iota(MetalTest *t)
@@ -2943,6 +3015,7 @@ static const struct {
 	{ "metal.depth", test_metal_depth },
 	{ "metal.msaa", test_metal_msaa },
 	{ "metal.iota", test_metal_iota },
+	{ "metal.event", test_metal_event },
 	{ "metal.add", test_metal_add },
 	{ "metal.gradient", test_metal_gradient },
 	{ "metal.sizes", test_metal_sizes },
