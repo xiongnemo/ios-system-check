@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>System Check</string>
+	<key>CFBundleExecutable</key>
+	<string>SystemCheck</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.anzupop.com.ios.systemcheck</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>SystemCheck</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+		</dict>
+	</dict>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.anzupop.com.ios.systemcheck</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>systemcheck</string>
+			</array>
+		</dict>
+	</array>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>15.0</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>System Check lists the cameras and shows whether it may use them. It takes no picture.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>System Check shows the microphone's level. Nothing is kept: the recording is deleted as it goes.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>System Check shows the location and the compass's true heading while its Sensors tab is open.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>System Check shows whether Bluetooth is there and on. It connects to nothing.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>System Check shows the barometer, the steps and the motion activity.</string>
+</dict>
+</plist>

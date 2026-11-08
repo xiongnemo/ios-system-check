@@ -1,0 +1,26 @@
+# SystemCheck.ipa on a macOS runner (Xcode's clang and SDK), kept as the run's artifact: on every push, and by hand.
+# A tag v<version> (v1.0) also publishes it on the Releases page as SystemCheck-<version>.ipa.
+name: build
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SystemCheck-ipa
+          path: build/SystemCheck.ipa
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          cp build/SystemCheck.ipa "build/SystemCheck-$v.ipa"
+          gh release create "$GITHUB_REF_NAME" "build/SystemCheck-$v.ipa" --title "System Check $v" --notes "Not signed by Apple: for an iOS that installs apps without Apple's signature, such as the Redmi K40 port (https://github.com/xiongnemo/hakios-alioth)."
