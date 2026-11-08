@@ -180,8 +180,10 @@ transform_of(mat3 n)
 	[super viewDidLayoutSubviews];
 	self.stage.frame = CGRectMake(0, top, all.size.width, all.size.height * 0.46);
 	self.hint.frame = CGRectMake(0, self.stage.bounds.size.height - 22, all.size.width, 18);
-	self.label.frame = CGRectMake(16, CGRectGetMaxY(self.stage.frame) + 6, all.size.width - 32,
-	    all.size.height - safe.bottom - CGRectGetMaxY(self.stage.frame) - 12);
+	/* (ten lines high at most, from the top: a label taller than its text would centre it) */
+	self.label.frame = CGRectMake(16, CGRectGetMaxY(self.stage.frame) + 12, all.size.width - 32,
+	    MIN(ceil(self.label.font.lineHeight * 10) + 4,
+	    all.size.height - safe.bottom - CGRectGetMaxY(self.stage.frame) - 18));
 	if (self.phone == nil) {
 		[self buildPhone];
 	}

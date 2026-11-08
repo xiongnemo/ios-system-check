@@ -284,11 +284,14 @@ gpu_param(io_connect_t gpu, uint32_t which, uint64_t *value)
 	return YES;
 }
 
-/* Does the main program itself load this library (its load commands, not what others brought in)? */
+/* Does the main program itself load this library (its load commands, not what others brought in)? (Its header is
+   _mh_execute_header: dyld's image 0 is not always the program -- on the K40 port it was not.) */
+extern const struct mach_header_64 _mh_execute_header;
+
 static BOOL
 main_links(const char *library)
 {
-	const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+	const struct mach_header_64 *header = &_mh_execute_header;
 	const struct load_command *command = (const struct load_command *)(header + 1);
 
 	for (uint32_t i = 0; i < header->ncmds; i++) {
@@ -1345,7 +1348,7 @@ uncaught(NSException *exception)
 - (instancetype)init
 {
 	if ((self = [super initWithStyle:UITableViewStyleInsetGrouped]) != nil) {
-		self.title = @"Metal Check";
+		self.navigationItem.title = @"Metal Check";
 		self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Run"
 		    style:UIBarButtonItemStylePlain target:self action:@selector(runButton)];
 		_marked = [NSMutableSet set];
@@ -1355,28 +1358,45 @@ uncaught(NSException *exception)
 }
 
 /* the on-screen tests' stage: a black square at the top right of the list, the triangle's below it (the test puts it
-   there), what they are on the left */
+   there, from the first one's frame), what they are on the left */
 - (void)viewDidLoad
 {
 	UIView *header;
 	UILabel *what;
-	CGFloat width = self.view.bounds.size.width;
 
 	[super viewDidLoad];
-	header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, 8 + 120 + 16 + 120 + 8)];
-	g_stage = [[UIView alloc] initWithFrame:CGRectMake(width - 136, 8, 120, 120)];
+	header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 8 + 120 + 16 + 120 + 8)];
+	g_stage = [[UIView alloc] initWithFrame:CGRectMake(0, 8, 120, 120)];
 	g_stage.backgroundColor = UIColor.blackColor;
 	g_stage.userInteractionEnabled = NO;
-	g_stage.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
 	[header addSubview:g_stage];
-	what = [[UILabel alloc] initWithFrame:CGRectMake(20, 8, width - 136 - 36, 256)];
-	what.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+	what = [UILabel new];
+	what.tag = 1;
 	what.numberOfLines = 0;
 	what.font = [UIFont systemFontOfSize:12];
 	what.textColor = UIColor.secondaryLabelColor;
 	what.text = @"On the right, what the on-screen tests leave up: the top square cleared to blue "
 	    "(metal.clear.layer), the one below it with an orange triangle (metal.triangle.layer). Black: not drawn.";
 	[header addSubview:what];
+	self.tableView.tableHeaderView = header;
+}
+
+/* (the frames once the table has its width; the triangle's stage is only made by its test, after this) */
+- (void)viewDidLayoutSubviews
+{
+	UIView *header = self.tableView.tableHeaderView;
+	CGFloat width = self.tableView.bounds.size.width;
+	UILabel *what = [header viewWithTag:1];
+	CGSize fits;
+
+	[super viewDidLayoutSubviews];
+	if (width <= 0 || header.frame.size.width == width) {
+		return;
+	}
+	header.frame = CGRectMake(0, 0, width, header.frame.size.height);
+	g_stage.frame = CGRectMake(width - 136, 8, 120, 120);
+	fits = [what sizeThatFits:CGSizeMake(width - 136 - 36, CGFLOAT_MAX)];
+	what.frame = CGRectMake(20, 8, width - 136 - 36, fits.height);
 	self.tableView.tableHeaderView = header;
 }
 

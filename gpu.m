@@ -4174,7 +4174,7 @@ watch_for_hangs(void)
 - (void)viewDidLoad
 {
 	[super viewDidLoad];
-	self.title = @"GPU Check";
+	self.navigationItem.title = @"GPU Check";
 	for (int g = 0; g < G_COUNT; g++) {
 		_first[g] = -1;
 	}

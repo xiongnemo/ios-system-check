@@ -513,7 +513,7 @@ static void *volume_context = &volume_context;
 	UILabel *header = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 34)];
 
 	[super viewDidLoad];
-	self.title = @"Sensor Check";
+	self.navigationItem.title = @"Sensor Check";
 	_launched = [NSDate date];
 	_volume = -1;
 	_peakMax = -160;

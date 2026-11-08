@@ -19,6 +19,10 @@
 - 记录和原来一样：`Documents/gpucheck.log`、`Documents/metalcheck.log`（开了文件共享），
   `/dev/console` 和 NSLog 里的 `gpucheck: …`、`metalcheck: …`、`videocheck: …`。
 - 进程里只有一个崩溃处理函数（`main.m`），GPU 和 Metal 两页各自登记自己“正在跑哪一项”的回调。
+- `Info.plist` 里 `PrefersOpenGL` = YES：Metal 页注册了移植的 Metal 驱动以后（注册对整个进程有效，撤不回来），
+  SpriteKit、SceneKit 照样走 OpenGL ES，GPU 页测的仍是普通应用在移植上拿到的那条路。不加的话 SpriteKit 会改走
+  Metal，在移植上直接闪退（它的 Metal 渲染器找不到着色器库，`-[NSURL initFileURLWithPath:]` 拿到 nil）。
+  代价：在真 iPhone 上 SpriteKit、SceneKit 的“默认”也变成 OpenGL ES。
 
 - 包名：`com.anzupop.com.ios.systemcheck`
 - 最低 iOS 15.0，iPhone，竖屏
