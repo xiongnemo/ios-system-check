@@ -33,7 +33,7 @@ $CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
 	-framework OpenGLES -framework GLKit -framework CoreImage -framework AVFoundation -framework CoreMedia \
 	-framework AudioToolbox -framework CoreMotion -framework CoreLocation -framework CoreBluetooth \
 	-framework CoreHaptics -framework IOKit \
-	-weak_framework Metal -weak_framework SpriteKit -weak_framework SceneKit \
+	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit \
 	-o "$APP/SystemCheck" "$HERE/main.m" "$HERE/gpu.m" "$HERE/metal.m" "$HERE/video.m" "$HERE/sensors.m" \
 	"$HERE/motion.m"
 if command -v "$LDID" >/dev/null 2>&1; then

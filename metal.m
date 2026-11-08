@@ -10,6 +10,7 @@
 // and skipped from then on (until Run again). Every result is also a line on /dev/console ("metalcheck: ...") and in
 // NSLog.
 #import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <SceneKit/SceneKit.h>
 #import <SpriteKit/SpriteKit.h>
@@ -2441,6 +2442,100 @@ test_metal_spritekit(MetalTest *t)
 	}
 }
 
+/* metal.mtkview's delegate: each frame cleared to a colour of its own and presented, counted */
+@interface MetalViewCounter : NSObject <MTKViewDelegate>
+@property (nonatomic) id<MTLCommandQueue> queue;
+@property (nonatomic) unsigned frames, completed, failed;
+@property (nonatomic, copy) NSString *problem;
+@end
+
+@implementation MetalViewCounter
+
+- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size
+{
+	(void)view;
+	(void)size;
+}
+
+- (void)drawInMTKView:(MTKView *)view
+{
+	MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
+	id<CAMetalDrawable> drawable = view.currentDrawable;
+	id<MTLCommandBuffer> buffer;
+	id<MTLRenderCommandEncoder> encoder;
+
+	if (pass == nil || drawable == nil) {
+		self.problem = pass == nil ? @"no currentRenderPassDescriptor" : @"no currentDrawable";
+		return;
+	}
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake((self.frames % 60) / 60.0, 0.3, 0.6, 1);
+	buffer = [self.queue commandBuffer];
+	encoder = [buffer renderCommandEncoderWithDescriptor:pass];
+	[encoder endEncoding];
+	[buffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (done.status == MTLCommandBufferStatusCompleted) {
+				self.completed++;
+			} else {
+				self.failed++;
+			}
+		});
+	}];
+	[buffer presentDrawable:drawable];
+	[buffer commit];
+	self.frames++;
+}
+
+@end
+
+/*
+ * MTKView drawing continuously on this device: a 120x120 view for two seconds at the top left, every frame cleared and
+ * presented; how many came, how many completed. (The plan's "MTKView 连续画": what a Metal game's loop is.)
+ */
+static void
+test_metal_mtkview(MetalTest *t)
+{
+	UIWindow *window = UIApplication.sharedApplication.keyWindow;
+	MetalViewCounter *counter;
+	MTKView *view;
+	CFAbsoluteTime began;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if (NSClassFromString(@"MTKView") == nil || window == nil) {
+		[t skip:@"%@", window == nil ? @"no window" : @"no MetalKit"];
+		return;
+	}
+	counter = [MetalViewCounter new];
+	counter.queue = [g_device newCommandQueue];
+	view = [[MTKView alloc] initWithFrame:CGRectMake(0, 120, 120, 120) device:g_device];
+	view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+	view.preferredFramesPerSecond = 60;
+	view.delegate = counter;
+	[window addSubview:view];
+	began = CFAbsoluteTimeGetCurrent();
+	/* (the tests run on the main thread one after the other; the view's display link needs its run loop) */
+	while (CFAbsoluteTimeGetCurrent() - began < 2.0 && counter.problem == nil) {
+		[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+	}
+	view.paused = YES;
+	[view removeFromSuperview];
+	/* the last frames' completion handlers */
+	[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+	if (counter.problem != nil) {
+		[t fail:@"after %u frames: %@", counter.frames, counter.problem];
+	} else if (counter.frames >= 60 && counter.failed == 0 && counter.completed + 4 >= counter.frames) {
+		[t pass:@"%u frames in 2 s (%.0f a second), %u completed, none failed", counter.frames, counter.frames / 2.0,
+		    counter.completed];
+	} else {
+		[t fail:@"%u frames in 2 s, %u completed, %u failed (60 or more wanted, all completed)", counter.frames,
+		    counter.completed, counter.failed];
+	}
+}
+
 /* SceneKit asked for Metal: what it chose, and a snapshot of a magenta box on black */
 static void
 test_metal_scenekit(MetalTest *t)
@@ -2546,6 +2641,7 @@ static const struct {
 	{ "metal.blit", test_metal_blit },
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
+	{ "metal.mtkview", test_metal_mtkview },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
 
