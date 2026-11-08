@@ -1690,6 +1690,70 @@ test_metal_scissor(MetalTest *t)
 	}
 }
 
+/* (a pixel next to the middle row or column, where a clipped edge may fall either way) */
+static BOOL
+near_middle(unsigned v)
+{
+	return v == SIDE / 2 - 1 || v == SIDE / 2;
+}
+
+/*
+ * clip distances: the whole-target triangle with [[clip_distance]] [1] -- its clip-space x, so green on the right half
+ * only -- and with [2], x and y (up), so the top right quarter only (VectorKit's route lines use the first shape)
+ */
+static void
+test_metal_clip(MetalTest *t)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	NSString *problem = nil;
+	unsigned wrong1 = 0, wrong2 = 0;
+	void (^draw)(id<MTLRenderCommandEncoder>) = ^(id<MTLRenderCommandEncoder> e) {
+		const float colour[4] = { 0, 1, 0, 1 };
+
+		[e setFragmentBytes:colour length:sizeof(colour) atIndex:0];
+		[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	};
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if ([g_ours newFunctionWithName:@"v_clip1"] == nil) {
+		[t skip:@"this alioth-tests.metallib has no v_clip1 (devtools v3 has it)"];
+		return;
+	}
+	if (!render_ours(@"v_clip1", @"f_solid", MTLClearColorMake(0, 0, 0, 1), nil, nil, draw, px, &problem)) {
+		[t fail:@"one distance: %@", problem];
+		return;
+	}
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (!near_middle(x)) {
+				wrong1 += !px_near(px + (y * SIDE + x) * 4, 0, x >= SIDE / 2 ? 255 : 0, 0, 255, 1);
+			}
+		}
+	}
+	NSString *left = px_text(px, 8, SIDE / 2), *right = px_text(px, SIDE - 8, SIDE / 2);
+	if (!render_ours(@"v_clip2", @"f_solid", MTLClearColorMake(0, 0, 0, 1), nil, nil, draw, px, &problem)) {
+		[t fail:@"two distances: %@ (one distance: %u pixels wrong)", problem, wrong1];
+		return;
+	}
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (!near_middle(x) && !near_middle(y)) {
+				BOOL in = x >= SIDE / 2 && y < SIDE / 2;
+
+				wrong2 += !px_near(px + (y * SIDE + x) * 4, 0, in ? 255 : 0, 0, 255, 1);
+			}
+		}
+	}
+	if (wrong1 == 0 && wrong2 == 0) {
+		[t pass:@"[1]: green on the right half only; [2]: the top right quarter only"];
+	} else {
+		[t fail:@"[1]: %u pixels wrong (left %@, right %@); [2]: %u wrong (top right %@, bottom left %@)", wrong1, left,
+		    right, wrong2, px_text(px, SIDE - 8, 8), px_text(px, 8, SIDE - 8)];
+	}
+}
+
 /*
  * cull mode and winding: a red triangle on the left whose corners run counter-clockwise (Metal's y up) and a green
  * one on the right running clockwise, front faces counter-clockwise. Culling back faces keeps the red one only;
@@ -2872,6 +2936,7 @@ static const struct {
 	{ "metal.viewport", test_metal_viewport },
 	{ "metal.scissor", test_metal_scissor },
 	{ "metal.cull", test_metal_cull },
+	{ "metal.clip", test_metal_clip },
 	{ "metal.blendcolor", test_metal_blendcolor },
 	{ "metal.indirect", test_metal_indirect },
 	{ "metal.heap", test_metal_heap },

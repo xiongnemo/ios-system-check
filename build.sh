@@ -45,9 +45,9 @@ sed 's/\r$//' "$HERE/Info.plist" > "$APP/Info.plist"
 cp "$HERE/test.mp4" "$APP/"
 # the Metal tab's own shaders, built from source by github.com/xiongnemo/ios-alioth-devtools (metal/alioth-tests.metal,
 # Xcode's compiler, for iOS 16): its release's alioth-tests.metallib, fetched once into build/ (METALLIB=FILE: that one)
-METALLIB=${METALLIB:-$OUT/alioth-tests-v2.metallib}
+METALLIB=${METALLIB:-$OUT/alioth-tests-v3.metallib}
 if [ ! -f "$METALLIB" ]; then
-	curl -fsSL -o "$METALLIB" https://github.com/xiongnemo/ios-alioth-devtools/releases/download/v2/alioth-tests.metallib
+	curl -fsSL -o "$METALLIB" https://github.com/xiongnemo/ios-alioth-devtools/releases/download/v3/alioth-tests.metallib
 fi
 cp "$METALLIB" "$APP/alioth-tests.metallib"
 python3 -I "$HERE/mkicon.py" "$APP"
