@@ -6,7 +6,7 @@
 | 标签 | 原来的应用 | 做什么 |
 | --- | --- | --- |
 | GPU | GPU Check | 把 iOS 游戏可能用到的图形能力逐项测一遍（OpenGL ES 1/2/3、纹理和压缩格式、扩展、上屏、GLKit、CADisplayLink、Core Image、Metal、SceneKit、SpriteKit），每项 PASS / FAIL / SKIP，把应用带崩或卡住的记 CRASHED / HUNG |
-| Metal | Metal Check | 应用能找到的 Metal：系统、GPU 内核服务、Metal 的设备发现、移植的驱动用到的私有部分；Metal 没有自己的设备时，由应用注册移植的驱动，再测命令队列、清屏、三角形、compute（离屏读回，加上顶部两个方块里的上屏结果） |
+| Metal | Metal Check | 应用能找到的 Metal：系统、GPU 内核服务、Metal 的设备发现、移植的驱动用到的私有部分；Metal 没有自己的设备时，由应用注册移植的驱动，再测命令队列、清屏、三角形、compute（离屏读回，加上顶部两个方块里的上屏结果）；用 [ios-alioth-devtools](https://github.com/xiongnemo/ios-alioth-devtools) 编的测试着色器逐项测顶点、纹理、混合、视口、裁剪、剔除、深度、4x MSAA、compute 的各种写入、threadgroup 内存、function constant、blit；SpriteKit（SKRenderer）、SceneKit（SCNView 指定 Metal）、MTKView 连续画两秒 |
 | Video | VideoCheck | 用 AVPlayer + AVPlayerLayer 循环播放内置的 6 秒测试视频（ffmpeg 的 testsrc2），报告播放器状态 |
 | Sensors | Sensor Check | 每个传感器和硬件输入实时显示：光线、距离、加速度计、陀螺仪、磁力计、气压、计步、指南针、定位、电池、麦克风、摄像头、蓝牙、方向、音量键、屏幕帧率、触摸、振动 |
 | Motion | Motion Test | 一部 3D 的手机跟着这台手机转（CoreMotion 的姿态），下面是加速度计、陀螺仪、设备运动的数值 |
@@ -22,13 +22,15 @@
 - 测试自己的调用抛出的 Objective-C 异常算这一项 FAIL（带抛出位置：共享缓存的 slide 和返回地址），不再让应用闪退；
   之后在别的 run loop 里抛的照样会带崩应用，下次启动标记、跳过。
 - Metal 页注册移植的 Metal 驱动以后（对整个进程有效，撤不回来），同一次启动里 GPU 页的 Metal 两项会过，
-  而 `spritekit.view` 会 FAIL：SpriteKit 看到有 Metal 设备就改走 Metal，它的 Metal 渲染器在移植上抛异常
-  （`-[NSURL initFileURLWithPath:]` 拿到 nil）。要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
+  SpriteKit 的两项也改走 Metal（SpriteKit 看到有 Metal 设备就用它）。反过来，GPU 页先跑过 SKView / SCNView，
+  SpriteKit、SceneKit 在这个进程里就定在 OpenGL ES 上了，Metal 页的 `metal.spritekit`、`metal.scenekit` 记 SKIP。
+  要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
 
 - 包名：`com.anzupop.com.ios.systemcheck`
 - 最低 iOS 15.0，iPhone，竖屏
 - 只用 Objective-C 和系统框架；每个标签页一个 `.m` 文件，没有 storyboard、asset catalog
-- 链接 OpenGLES（移植只给主程序链接了 OpenGLES 的应用 GL），Metal、SpriteKit、SceneKit 弱链接
+- 链接 OpenGLES（移植只给主程序链接了 OpenGLES 的应用 GL），Metal、MetalKit、SpriteKit、SceneKit 弱链接
+- `build.sh` 从 devtools 的 v2 发布下载 `alioth-tests.metallib`（`METALLIB=文件` 用自己的）
 - 图标由 `mkicon.py` 生成（纯 Python）：四块分别代表 GPU、Metal、视频、传感器，中间一个对勾
 - `Entitlements.plist`：`com.apple.private.hid.client.event-monitor`（光线传感器的 HID 事件要它）
 
