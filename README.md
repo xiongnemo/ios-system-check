@@ -19,10 +19,11 @@
 - 记录和原来一样：`Documents/gpucheck.log`、`Documents/metalcheck.log`（开了文件共享），
   `/dev/console` 和 NSLog 里的 `gpucheck: …`、`metalcheck: …`、`videocheck: …`。
 - 进程里只有一个崩溃处理函数（`main.m`），GPU 和 Metal 两页各自登记自己“正在跑哪一项”的回调。
-- `Info.plist` 里 `PrefersOpenGL` = YES：Metal 页注册了移植的 Metal 驱动以后（注册对整个进程有效，撤不回来），
-  SpriteKit、SceneKit 照样走 OpenGL ES，GPU 页测的仍是普通应用在移植上拿到的那条路。不加的话 SpriteKit 会改走
-  Metal，在移植上直接闪退（它的 Metal 渲染器找不到着色器库，`-[NSURL initFileURLWithPath:]` 拿到 nil）。
-  代价：在真 iPhone 上 SpriteKit、SceneKit 的“默认”也变成 OpenGL ES。
+- 测试自己的调用抛出的 Objective-C 异常算这一项 FAIL（带抛出位置：共享缓存的 slide 和返回地址），不再让应用闪退；
+  之后在别的 run loop 里抛的照样会带崩应用，下次启动标记、跳过。
+- Metal 页注册移植的 Metal 驱动以后（对整个进程有效，撤不回来），同一次启动里 GPU 页的 Metal 两项会过，
+  而 `spritekit.view` 会 FAIL：SpriteKit 看到有 Metal 设备就改走 Metal，它的 Metal 渲染器在移植上抛异常
+  （`-[NSURL initFileURLWithPath:]` 拿到 nil）。要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
 
 - 包名：`com.anzupop.com.ios.systemcheck`
 - 最低 iOS 15.0，iPhone，竖屏

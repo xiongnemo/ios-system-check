@@ -69,6 +69,24 @@ check_watch_crashes(void (*on_signal)(int signal), void (*on_exception)(NSExcept
 	}
 }
 
+/* dyld's: where the shared cache is (iOS 13 and later); an arm64 iPhone's cache is linked at 0x180000000 */
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+
+NSString *
+check_backtrace(NSException *exception)
+{
+	NSMutableString *text = [NSMutableString string];
+	size_t length = 0;
+	const void *cache = _dyld_get_shared_cache_range(&length);
+	NSArray<NSNumber *> *addresses = exception.callStackReturnAddresses;
+
+	[text appendFormat:@"slide %#lx:", cache != NULL ? (unsigned long)((uintptr_t)cache - 0x180000000UL) : 0UL];
+	for (NSUInteger i = 0; i < addresses.count && i < 24; i++) {
+		[text appendFormat:@" %#lx", (unsigned long)addresses[i].unsignedLongValue];
+	}
+	return text;
+}
+
 #pragma mark the tabs
 
 static const struct tab {

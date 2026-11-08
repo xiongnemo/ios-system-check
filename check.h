@@ -20,3 +20,7 @@ void video_run(void);
  * application down as it would have; on an uncaught exception, each on_exception. Either may be NULL.
  */
 void check_watch_crashes(void (*on_signal)(int signal), void (*on_exception)(NSException *exception));
+
+/* where an exception was thrown, for a log line: "slide 0x...: 0x... 0x..." -- the shared cache's slide and the
+   return addresses, which the port's tools turn into names (work/wsl/dsc-a2s.sh SLIDE ADDR...) */
+NSString *check_backtrace(NSException *exception);

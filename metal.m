@@ -1326,8 +1326,8 @@ uncaught(NSException *exception)
 	int running = g_running;
 
 	if (running >= 0 && running < (int)TEST_COUNT) {
-		record("crashed", g_tests[running].ident, [NSString stringWithFormat:@"%@: %@", exception.name,
-		    exception.reason]);
+		record("crashed", g_tests[running].ident, [NSString stringWithFormat:@"%@: %@ (%@)", exception.name,
+		    exception.reason, check_backtrace(exception)]);
 		say(@"%s CRASHED %@: %@ (the next launch marks it and goes on)", g_tests[running].ident, exception.name,
 		    exception.reason);
 	}
@@ -1343,6 +1343,7 @@ uncaught(NSException *exception)
 	NSMutableSet<NSString *> *_marked;
 	NSString *_summary;
 	BOOL _ran, _runWhenShown;
+	CGFloat _laidOut;               /* the width the header was laid out for */
 }
 
 - (instancetype)init
@@ -1390,9 +1391,11 @@ uncaught(NSException *exception)
 	CGSize fits;
 
 	[super viewDidLayoutSubviews];
-	if (width <= 0 || header.frame.size.width == width) {
+	/* (not the header's own width: the table sets that itself) */
+	if (width <= 0 || _laidOut == width) {
 		return;
 	}
+	_laidOut = width;
 	header.frame = CGRectMake(0, 0, width, header.frame.size.height);
 	g_stage.frame = CGRectMake(width - 136, 8, 120, 120);
 	fits = [what sizeThatFits:CGSizeMake(width - 136 - 36, CGFLOAT_MAX)];
@@ -1489,7 +1492,12 @@ uncaught(NSException *exception)
 			record("running", t.ident, @"");
 			g_running = (sig_atomic_t)i;
 			[t verdict:ST_RUNNING detail:@""];
-			g_tests[i].run(t);
+			/* (an exception the test's calls throw is its FAIL, with where it came from) */
+			@try {
+				g_tests[i].run(t);
+			} @catch (NSException *exception) {
+				[t fail:@"exception %@: %@ (%@)", exception.name, exception.reason, check_backtrace(exception)];
+			}
 			g_running = -1;
 		}
 		counts[t.status]++;

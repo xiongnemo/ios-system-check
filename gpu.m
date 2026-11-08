@@ -4053,6 +4053,7 @@ crash_exception(NSException *exception)
 	if (what.length > 200) {
 		what = [[what substringToIndex:200] stringByAppendingString:@"..."];
 	}
+	what = [what stringByAppendingFormat:@" (%@)", check_backtrace(exception)];
 	record("crashed", tests[i].ident, NULL, what);
 	say(@"%s CRASHED %@ (the next launch marks it and goes on)", tests[i].ident, what);
 }
@@ -4420,10 +4421,19 @@ watch_for_hangs(void)
 	t.done = ^(Test *test) {
 		[weak finished:test];
 	};
+	/* (an exception the test's own calls throw is its FAIL, with where it came from -- not the application's end;
+	   one thrown later, on a run loop turn of its own, still takes it down, and the next launch marks it) */
 	@autoreleasepool {
-		tests[i].run(t);
+		@try {
+			tests[i].run(t);
+		} @catch (NSException *exception) {
+			[t fail:@"exception %@: %@ (%@)", exception.name, exception.reason, check_backtrace(exception)];
+			if (t.async && !t.ended) {
+				[t end];
+			}
+		}
 	}
-	if (!t.async) {
+	if (!t.ended && !t.async) {
 		[t end];
 	} else if (!t.ended) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ASYNC_LIMIT * NSEC_PER_SEC)), dispatch_get_main_queue(),
