@@ -9,6 +9,7 @@
 // before it starts and when it ends, so that one that takes the application down is found at the next launch, marked,
 // and skipped from then on (until Run again). Every result is also a line on /dev/console ("metalcheck: ...") and in
 // NSLog.
+#import <MapKit/MapKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -2720,6 +2721,129 @@ test_metal_scenekit(MetalTest *t)
 	}
 }
 
+/* the first layer of a class whose name has `part` in it, under `layer` (itself included) */
+static CALayer *
+layer_named(CALayer *layer, NSString *part)
+{
+	if ([NSStringFromClass([layer class]) containsString:part]) {
+		return layer;
+	}
+	for (CALayer *sub in layer.sublayers) {
+		CALayer *found = layer_named(sub, part);
+
+		if (found != nil) {
+			return found;
+		}
+	}
+	return nil;
+}
+
+/*
+ * MapKit, whose maps VectorKit draws -- with Metal, on whatever device MTLCreateSystemDefaultDevice() answers: one of
+ * the heaviest Metal clients in iOS, here on this device. A whole-window MKMapView for three seconds (what draws it: a
+ * CAMetalLayer or not), then an MKMapSnapshotter's picture of the same place: how many colours a 32 x 32 copy of it
+ * has. One colour is a map drawn without its tiles (they come from Apple's servers) or not drawn at all.
+ */
+static void
+test_metal_mapkit(MetalTest *t)
+{
+	UIWindow *window = UIApplication.sharedApplication.keyWindow;
+	MKCoordinateRegion region;
+	MKMapSnapshotOptions *options;
+	MKMapSnapshotter *snapshotter;
+	MKMapView *map;
+	CALayer *metal;
+	CFAbsoluteTime began;
+	__block UIImage *picture = nil;
+	__block NSError *failure = nil;
+	__block BOOL done = NO;
+	unsigned char pixels[32 * 32 * 4] = { 0 };
+	unsigned colours = 0;
+	uint32_t seen[64];
+	CGContextRef context;
+	CGColorSpaceRef rgb;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if (NSClassFromString(@"MKMapView") == nil || window == nil) {
+		[t skip:@"%@", window == nil ? @"no window" : @"no MapKit"];
+		return;
+	}
+	/* (MapKit is linked weakly: its functions only once it is known to be there) */
+	region = MKCoordinateRegionMakeWithDistance(CLLocationCoordinate2DMake(48.8584, 2.2945), 2000, 2000);
+	map = [[MKMapView alloc] initWithFrame:window.bounds];
+	[map setRegion:region animated:NO];
+	[window addSubview:map];
+	began = CFAbsoluteTimeGetCurrent();
+	[t note:@"on screen now for 3 s: a map of the Champ de Mars, Paris"];
+	while (CFAbsoluteTimeGetCurrent() - began < 3.0) {
+		[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+	}
+	metal = layer_named(map.layer, @"MetalLayer");
+	[t note:@"drawn into %@", metal != nil ? [NSString stringWithFormat:@"a %@ (%.0f x %.0f drawable)",
+	    NSStringFromClass([metal class]), ((CAMetalLayer *)metal).drawableSize.width,
+	    ((CAMetalLayer *)metal).drawableSize.height] : @"no CAMetalLayer in the view's layers"];
+	[map removeFromSuperview];
+
+	options = [MKMapSnapshotOptions new];
+	options.region = region;
+	options.size = CGSizeMake(256, 256);
+	snapshotter = [[MKMapSnapshotter alloc] initWithOptions:options];
+	[snapshotter startWithCompletionHandler:^(MKMapSnapshot *snapshot, NSError *error) {
+		picture = snapshot.image;
+		failure = error;
+		done = YES;
+	}];
+	began = CFAbsoluteTimeGetCurrent();
+	while (!done && CFAbsoluteTimeGetCurrent() - began < 20.0) {
+		[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+	}
+	if (!done) {
+		[snapshotter cancel];
+		[t fail:@"MKMapSnapshotter: no picture in 20 s (%@)", metal != nil ? @"the view drew on a CAMetalLayer" :
+		    @"and the view had no CAMetalLayer"];
+		return;
+	}
+	if ((picture == nil || picture.CGImage == NULL) && [failure.domain isEqualToString:MKErrorDomain] &&
+	    (failure.code == MKErrorServerFailure || failure.code == MKErrorLoadingThrottled)) {
+		/* (no map data came: what the picture would show is not this device's doing either way) */
+		[t skip:@"MKMapSnapshotter: no map data from Apple's servers here (MKErrorDomain %ld); the view drew on %@",
+		    (long)failure.code, metal != nil ? NSStringFromClass([metal class]) : @"no CAMetalLayer"];
+		return;
+	}
+	if (picture == nil || picture.CGImage == NULL) {
+		[t fail:@"MKMapSnapshotter: no picture: %@", failure.localizedDescription ?: @"no error either"];
+		return;
+	}
+	rgb = CGColorSpaceCreateDeviceRGB();
+	context = CGBitmapContextCreate(pixels, 32, 32, 8, 32 * 4, rgb, kCGImageAlphaPremultipliedLast);
+	CGContextDrawImage(context, CGRectMake(0, 0, 32, 32), picture.CGImage);
+	CGContextRelease(context);
+	CGColorSpaceRelease(rgb);
+	for (unsigned i = 0; i < 32 * 32 && colours < 64; i++) {
+		uint32_t c = (uint32_t)(pixels[i * 4] >> 4) << 8 | (uint32_t)(pixels[i * 4 + 1] >> 4) << 4 | pixels[i * 4 + 2] >> 4;
+		unsigned k = 0;
+
+		while (k < colours && seen[k] != c) {
+			k++;
+		}
+		if (k == colours) {
+			seen[colours++] = c;
+		}
+	}
+	if (colours >= 8) {
+		[t pass:@"a %.0f x %.0f picture of %u%s colours (a 32 x 32 copy, 4 bits a channel); the view drew on %@",
+		    picture.size.width * picture.scale, picture.size.height * picture.scale, colours, colours >= 64 ? " or more" : "",
+		    metal != nil ? NSStringFromClass([metal class]) : @"no CAMetalLayer"];
+	} else {
+		[t fail:@"the picture has %u colour%s, the middle R G B A %u %u %u %u: tiles not loaded, or nothing drawn",
+		    colours, colours == 1 ? "" : "s", pixels[(16 * 32 + 16) * 4], pixels[(16 * 32 + 16) * 4 + 1],
+		    pixels[(16 * 32 + 16) * 4 + 2], pixels[(16 * 32 + 16) * 4 + 3]];
+	}
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -2766,6 +2890,7 @@ static const struct {
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
+	{ "metal.mapkit", test_metal_mapkit },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
 

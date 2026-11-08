@@ -25,7 +25,7 @@ mkdir -p "$APP"
 # (-target, not -arch and -miphoneos-version-min: a wrapper such as xnu-clang puts its own -target ios16.5 first, which
 # wins over -miphoneos-version-min, and the program would then ask for iOS 16.5; the last -target is the one that counts)
 # (OpenGLES linked by the program itself, not only through GLKit: the K40 port gives an application the GPU's OpenGL ES
-# only when its main binary loads OpenGLES.framework. Metal, SpriteKit and SceneKit weakly: where one is missing, the
+# only when its main binary loads OpenGLES.framework. Metal, SpriteKit, SceneKit and MapKit weakly: where one is missing, the
 # application still starts and that test says so. IOKit: the SDK has its library, not its headers; the GPU's kernel
 # service and the light sensor are reached through it.)
 $CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
@@ -33,7 +33,7 @@ $CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
 	-framework OpenGLES -framework GLKit -framework CoreImage -framework AVFoundation -framework CoreMedia \
 	-framework AudioToolbox -framework CoreMotion -framework CoreLocation -framework CoreBluetooth \
 	-framework CoreHaptics -framework IOKit \
-	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit \
+	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit -weak_framework MapKit \
 	-o "$APP/SystemCheck" "$HERE/main.m" "$HERE/gpu.m" "$HERE/metal.m" "$HERE/video.m" "$HERE/sensors.m" \
 	"$HERE/motion.m"
 if command -v "$LDID" >/dev/null 2>&1; then
