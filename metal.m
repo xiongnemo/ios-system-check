@@ -4000,8 +4000,28 @@ test_metal_engine(MetalTest *t)
  * (1125 x 2436 here), presented, for three seconds -- the number that says whether such a game would be playable, and
  * a hunt for whatever the size breaks (4x MSAA RGBA16Float and its depth at that size, a bloom chain half of it).
  */
+static void engine_screen(MetalTest *t, NSUInteger drawables);
+
 static void
 test_metal_engine_screen(MetalTest *t)
+{
+	engine_screen(t, 3);
+}
+
+/*
+ * The same with two drawables in the layer's rotation instead of Metal's three: on the K40 port a full-screen surface
+ * is scanned out by the display engine only from one of four slots, two of which CoreAnimation's own surfaces hold, so
+ * the third drawable's frames are copied by the processor (2026-11-09: 89 of 158 copied). What two drawables gain over
+ * three is that copy.
+ */
+static void
+test_metal_engine_screen2(MetalTest *t)
+{
+	engine_screen(t, 2);
+}
+
+static void
+engine_screen(MetalTest *t, NSUInteger drawables)
 {
 	UIWindow *window = UIApplication.sharedApplication.keyWindow;
 	CAMetalLayer *layer;
@@ -4016,6 +4036,7 @@ test_metal_engine_screen(MetalTest *t)
 	layer.device = g_device;
 	layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
 	layer.framebufferOnly = YES;
+	layer.maximumDrawableCount = drawables;
 	layer.frame = window.bounds;
 	layer.contentsScale = scale;
 	layer.drawableSize = CGSizeMake(window.bounds.size.width * scale, window.bounds.size.height * scale);
@@ -4780,6 +4801,7 @@ static const struct {
 	{ "metal.mtkview", test_metal_mtkview },
 	{ "metal.engine", test_metal_engine },
 	{ "metal.engine.screen", test_metal_engine_screen },
+	{ "metal.engine.screen2", test_metal_engine_screen2 },
 	{ "metal.features", test_metal_features },
 	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
