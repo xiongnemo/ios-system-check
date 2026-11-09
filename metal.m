@@ -5016,6 +5016,176 @@ test_metal_vertex_texture(MetalTest *t)
 	}
 }
 
+#pragma mark a render target the way Flutter's renderer makes one
+
+static NSString *const kTargetSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct V { float4 p [[position]]; };\n"
+"vertex V v_rect(uint i [[vertex_id]], constant float4 &r [[buffer(0)]]) {\n"
+"    float2 c[6] = { float2(r.x, r.y), float2(r.z, r.y), float2(r.x, r.w), float2(r.z, r.y), float2(r.z, r.w),\n"
+"                    float2(r.x, r.w) };\n"
+"    V o; o.p = float4(c[i], 0.0, 1.0); return o;\n"
+"}\n"
+"fragment half4 f_paint(constant float4 &c [[buffer(0)]]) { return half4(c); }\n";
+
+/*
+ * Flutter's Impeller draws a frame into a 4x multisampled BGRA8 target that is never stored (memoryless) and is resolved
+ * into the drawable, with a 4x multisampled depth+stencil (or stencil-only) attachment, also memoryless, for its clips:
+ * a clip is a draw that writes the stencil and no colour, the content after it is tested against the stencil. Each
+ * stencil format: the left half clipped in, a blue cover over everything, read back from the resolved texture.
+ */
+static void
+test_metal_msaa_stencil(MetalTest *t)
+{
+	enum { TS = 64 };
+	static const MTLPixelFormat formats[] = { MTLPixelFormatDepth32Float_Stencil8, MTLPixelFormatStencil8 };
+	NSMutableArray<NSString *> *good = [NSMutableArray array], *bad = [NSMutableArray array];
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLCommandQueue> queue;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kTargetSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	queue = [g_device newCommandQueue];
+	for (unsigned k = 0; k < sizeof(formats) / sizeof(formats[0]); k++) {
+		MTLPixelFormat zf = formats[k];
+		BOOL depth = zf == MTLPixelFormatDepth32Float_Stencil8;
+		const char *name = depth ? "Depth32Float_Stencil8" : "Stencil8";
+		MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:TS
+		    height:TS mipmapped:NO];
+		MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:TS
+		    height:TS mipmapped:NO];
+		MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:zf width:TS height:TS mipmapped:NO];
+		MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+		MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+		MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+		id<MTLRenderPipelineState> clip, cover;
+		id<MTLDepthStencilState> write, test;
+		id<MTLTexture> msaa, resolved, zs;
+		id<MTLCommandBuffer> b;
+		id<MTLRenderCommandEncoder> e;
+		NSString *problem = nil;
+		unsigned char px[TS * TS * 4];
+		unsigned wrong = 0;
+		int first = -1;
+
+		cd.textureType = MTLTextureType2DMultisample;
+		cd.sampleCount = 4;
+		cd.storageMode = MTLStorageModeMemoryless;
+		cd.usage = MTLTextureUsageRenderTarget;
+		rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		zd.textureType = MTLTextureType2DMultisample;
+		zd.sampleCount = 4;
+		zd.storageMode = MTLStorageModeMemoryless;
+		zd.usage = MTLTextureUsageRenderTarget;
+		msaa = [g_device newTextureWithDescriptor:cd];
+		resolved = [g_device newTextureWithDescriptor:rd];
+		zs = [g_device newTextureWithDescriptor:zd];
+		if (msaa == nil || resolved == nil || zs == nil) {
+			[bad addObject:[NSString stringWithFormat:@"%s: no %s texture", name, msaa == nil ? "4x BGRA8" : resolved == nil ?
+			    "resolve" : "4x stencil"]];
+			continue;
+		}
+		p.vertexFunction = [lib newFunctionWithName:@"v_rect"];
+		p.fragmentFunction = [lib newFunctionWithName:@"f_paint"];
+		p.rasterSampleCount = 4;
+		p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		p.depthAttachmentPixelFormat = depth ? zf : MTLPixelFormatInvalid;
+		p.stencilAttachmentPixelFormat = zf;
+		p.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+		clip = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+		p.colorAttachments[0].writeMask = MTLColorWriteMaskAll;
+		cover = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+		if (clip == nil || cover == nil) {
+			[bad addObject:[NSString stringWithFormat:@"%s: the pipeline was refused: %@", name,
+			    error.localizedDescription ?: @"nil, no error"]];
+			continue;
+		}
+		dd.depthCompareFunction = MTLCompareFunctionAlways;
+		dd.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionAlways;
+		dd.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+		dd.backFaceStencil = dd.frontFaceStencil;
+		write = [g_device newDepthStencilStateWithDescriptor:dd];
+		dd.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+		dd.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationKeep;
+		dd.backFaceStencil = dd.frontFaceStencil;
+		test = [g_device newDepthStencilStateWithDescriptor:dd];
+
+		d.colorAttachments[0].texture = msaa;
+		d.colorAttachments[0].resolveTexture = resolved;
+		d.colorAttachments[0].loadAction = MTLLoadActionClear;
+		d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+		d.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+		if (depth) {
+			d.depthAttachment.texture = zs;
+			d.depthAttachment.loadAction = MTLLoadActionClear;
+			d.depthAttachment.clearDepth = 1.0;
+			d.depthAttachment.storeAction = MTLStoreActionDontCare;
+		}
+		d.stencilAttachment.texture = zs;
+		d.stencilAttachment.loadAction = MTLLoadActionClear;
+		d.stencilAttachment.clearStencil = 0;
+		d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+		b = [queue commandBuffer];
+		e = [b renderCommandEncoderWithDescriptor:d];
+		{
+			const float left[4] = { -1, -1, 0, 1 }, all[4] = { -1, -1, 1, 1 }, blue[4] = { 0, 0, 1, 1 };
+
+			[e setStencilReferenceValue:1];
+			[e setRenderPipelineState:clip];
+			[e setDepthStencilState:write];
+			[e setVertexBytes:left length:sizeof(left) atIndex:0];
+			[e setFragmentBytes:blue length:sizeof(blue) atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+			[e setRenderPipelineState:cover];
+			[e setDepthStencilState:test];
+			[e setVertexBytes:all length:sizeof(all) atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		}
+		[e endEncoding];
+		if (!finish(b, &problem)) {
+			[bad addObject:[NSString stringWithFormat:@"%s: %@", name, problem]];
+			continue;
+		}
+		[resolved getBytes:px bytesPerRow:TS * 4 fromRegion:MTLRegionMake2D(0, 0, TS, TS) mipmapLevel:0];
+		for (unsigned y = 0; y < TS; y++) {
+			for (unsigned x = 0; x < TS; x++) {
+				const unsigned char *q = px + (y * TS + x) * 4;
+				BOOL in = x < TS / 2 - 1, out = x > TS / 2;     /* (the two columns at the edge are left alone) */
+
+				if ((in && !px_near(q, 255, 0, 0, 255, 2)) || (out && !px_near(q, 0, 0, 0, 255, 2))) {
+					wrong++;
+					if (first < 0) {
+						first = (int)(y * TS + x);
+					}
+				}
+			}
+		}
+		if (wrong == 0) {
+			[good addObject:@(name)];
+		} else {
+			const unsigned char *q = px + first * 4;
+
+			[bad addObject:[NSString stringWithFormat:@"%s: %u pixels wrong, the first (%d,%d) BGRA %u %u %u %u (blue on the "
+			    "left where the clip was, black on the right)", name, wrong, first % TS, first / TS, q[0], q[1], q[2], q[3]]];
+		}
+	}
+	if (bad.count == 0) {
+		[t pass:@"4x multisampled BGRA8 + 4x %@, memoryless, resolved: a clip written into the stencil with no colour, the "
+		    "cover drawn only inside it", [good componentsJoinedByString:@" / "]];
+	} else {
+		[t fail:@"%@%@", [bad componentsJoinedByString:@"; "], good.count ? [NSString stringWithFormat:@" (right: %@)",
+		    [good componentsJoinedByString:@", "]] : @""];
+	}
+}
+
 #pragma mark video frames as textures
 
 static NSString *const kPlanesKernel = @
@@ -5691,6 +5861,7 @@ static const struct {
 	{ "metal.vertex.texture", test_metal_vertex_texture },
 	{ "metal.mps", test_metal_mps },
 	{ "metal.cvtexture", test_metal_cvtexture },
+	{ "metal.msaa.stencil", test_metal_msaa_stencil },
 	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
