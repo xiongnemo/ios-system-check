@@ -1512,6 +1512,122 @@ test_metal_vbuffer(MetalTest *t)
 	}
 }
 
+/*
+ * Compressed textures, sampled (v_fullscreen + f_texture, nearest, over the 64x64 target): 8x8 texels of 2x2 blocks,
+ * each block one colour that the format encodes exactly, so each quarter of the target is that block's colour.
+ *   ASTC 4x4 LDR: void-extent blocks (a constant colour, 16 bits a channel)
+ *   ETC2 RGB8:    ETC1 individual-mode blocks, both halves base colour c (4 bits, c * 17), table 0, every texel's index
+ *                 3 (-8): c * 17 - 8, clamped
+ *   PVRTC 4bpp:   four identical blocks, colour A opaque red, modulation 0: red everywhere (the K40 port decodes PVRTC
+ *                 by the processor; the Adreno samples ASTC and ETC2 itself)
+ * (On the K40 port until 11-09 every compressed format was refused: no texture.)
+ */
+static NSString *
+compressed_round(MTLPixelFormat format, const uint8_t *blocks, NSUInteger bytes_per_row, const unsigned quarter[4][3])
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:8 height:8 mipmapped:NO];
+	MTLSamplerDescriptor *s = [MTLSamplerDescriptor new];
+	__block id<MTLTexture> texture;
+	__block id<MTLSamplerState> sampler;
+	NSString *problem = nil, *first = nil;
+	unsigned wrong = 0;
+
+	d.usage = MTLTextureUsageShaderRead;
+	if ((texture = [g_device newTextureWithDescriptor:d]) == nil) {
+		return @"no texture";
+	}
+	[texture replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:blocks bytesPerRow:bytes_per_row];
+	s.minFilter = s.magFilter = MTLSamplerMinMagFilterNearest;
+	s.sAddressMode = s.tAddressMode = MTLSamplerAddressModeClampToEdge;
+	sampler = [g_device newSamplerStateWithDescriptor:s];
+	if (!render_ours(@"v_fullscreen", @"f_texture", MTLClearColorMake(0, 0, 0, 1), nil, nil,
+	    ^(id<MTLRenderCommandEncoder> e) {
+		    [e setFragmentTexture:texture atIndex:0];
+		    [e setFragmentSamplerState:sampler atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	    }, px, &problem)) {
+		return problem;
+	}
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			const unsigned *q = quarter[(y >= SIDE / 2) * 2 + (x >= SIDE / 2)];
+
+			if (!px_near(px + (y * SIDE + x) * 4, q[2], q[1], q[0], 255, 1) && wrong++ == 0) {
+				first = px_text(px, x, y);
+			}
+		}
+	}
+	return wrong == 0 ? nil : [NSString stringWithFormat:@"%u of %u pixels wrong, the first %@ (B G R A; quarters wanted "
+	    "R G B %u %u %u / %u %u %u / %u %u %u / %u %u %u)", wrong, SIDE * SIDE, first, quarter[0][0], quarter[0][1],
+	    quarter[0][2], quarter[1][0], quarter[1][1], quarter[1][2], quarter[2][0], quarter[2][1], quarter[2][2],
+	    quarter[3][0], quarter[3][1], quarter[3][2]];
+}
+
+static void
+test_metal_compressed(MetalTest *t)
+{
+	/* the four blocks' colours, in block order: top left, top right, bottom left, bottom right */
+	static const unsigned astc_rgb[4][3] = { { 255, 0, 0 }, { 0, 255, 0 }, { 0, 0, 255 }, { 128, 128, 128 } };
+	static const unsigned etc_c4[4][3] = { { 15, 0, 0 }, { 0, 15, 0 }, { 0, 0, 15 }, { 8, 8, 8 } };
+	static const unsigned red[4][3] = { { 255, 0, 0 }, { 255, 0, 0 }, { 255, 0, 0 }, { 255, 0, 0 } };
+	unsigned etc_rgb[4][3];
+	uint8_t astc[4 * 16], etc[4 * 8], pvrtc[4 * 8];
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	NSString *r;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	for (unsigned b = 0; b < 4; b++) {
+		uint8_t *a = astc + b * 16, *e = etc + b * 8, *p = pvrtc + b * 8;
+		/* ASTC void-extent, LDR: 0x...FDFC in the low 64 bits, then R G B A as 16-bit UNORM (0x8080: 128 either way a
+		 * decoder rounds) */
+		static const uint8_t marker[8] = { 0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+		uint16_t c16[4] = { 0, 0, 0, 0xffff };
+
+		memcpy(a, marker, 8);
+		for (unsigned c = 0; c < 3; c++) {
+			c16[c] = astc_rgb[b][c] == 255 ? 0xffff : astc_rgb[b][c] == 128 ? 0x8080 : 0;
+		}
+		for (unsigned c = 0; c < 4; c++) {
+			a[8 + c * 2] = (uint8_t)(c16[c] & 0xff);
+			a[8 + c * 2 + 1] = (uint8_t)(c16[c] >> 8);
+		}
+		/* ETC1 individual mode (big-endian): R1R2 G1G2 B1B2, codewords 0, diff 0, flip 0, every index 3 */
+		e[0] = (uint8_t)(etc_c4[b][0] << 4 | etc_c4[b][0]);
+		e[1] = (uint8_t)(etc_c4[b][1] << 4 | etc_c4[b][1]);
+		e[2] = (uint8_t)(etc_c4[b][2] << 4 | etc_c4[b][2]);
+		e[3] = 0;
+		e[4] = e[5] = e[6] = e[7] = 0xff;
+		for (unsigned c = 0; c < 3; c++) {
+			int v = (int)(etc_c4[b][c] * 17) - 8;
+
+			etc_rgb[b][c] = (unsigned)(v < 0 ? 0 : v > 255 ? 255 : v);
+		}
+		/* PVRTC (little-endian words): modulation 0, colour word A = B = opaque red (0xfc00 each half) */
+		p[0] = p[1] = p[2] = p[3] = 0;
+		p[4] = 0x00;
+		p[5] = 0xfc;
+		p[6] = 0x00;
+		p[7] = 0xfc;
+	}
+	if ((r = compressed_round(MTLPixelFormatASTC_4x4_LDR, astc, 2 * 16, astc_rgb)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"ASTC 4x4: %@", r]];
+	}
+	if ((r = compressed_round(MTLPixelFormatETC2_RGB8, etc, 2 * 8, (const unsigned (*)[3])etc_rgb)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"ETC2 RGB8: %@", r]];
+	}
+	if ((r = compressed_round(MTLPixelFormatPVRTC_RGBA_4BPP, pvrtc, 0, red)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"PVRTC RGBA 4bpp: %@", r]];
+	}
+	if (bad.count == 0) {
+		[t pass:@"ASTC 4x4, ETC2 RGB8 and PVRTC 4bpp textures sampled: every block's colour where it belongs"];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /* v_fullscreen + f_texture: a 4x4 RGBA8 texture, nearest, over the whole target -- 16x16 blocks of its texels */
 static void
 test_metal_texture(MetalTest *t)
@@ -3473,6 +3589,7 @@ static const struct {
 	{ "metal.vertex", test_metal_vertex },
 	{ "metal.vbuffer", test_metal_vbuffer },
 	{ "metal.texture", test_metal_texture },
+	{ "metal.compressed", test_metal_compressed },
 	{ "metal.blend", test_metal_blend },
 	{ "metal.viewport", test_metal_viewport },
 	{ "metal.scissor", test_metal_scissor },
