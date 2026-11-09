@@ -3958,6 +3958,330 @@ test_metal_engine(MetalTest *t)
 	}
 }
 
+#pragma mark metal.features: what an engine reaches for besides the frame above
+
+/*
+ * Five things engines use and nothing above checks, each with pixels known exactly (64x64 RGBA8 targets, nearest
+ * sampling): a cube map sampled along four face directions (a skybox); one pass writing two colour attachments (a
+ * G-buffer); a stencil written by one draw and tested by the next (a UI mask); a layer of a 2D texture array (decals,
+ * terrain); and [[color(0)]] read back in the fragment shader -- framebuffer fetch, iOS's programmable blending.
+ */
+static NSString *const kFeaturesSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct QOut { float4 pos [[position]]; float2 uv; };\n"
+"vertex QOut v_full(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+"    QOut o; o.pos = float4(p * 2.0f - 1.0f, 0.0f, 1.0f); o.uv = float2(p.x, 1.0f - p.y); return o;\n"
+"}\n"
+"vertex QOut v_left(uint vid [[vertex_id]]) {\n"
+"    uint c = vid % 6;\n"
+"    float2 p = float2((c == 1 || c == 2 || c == 4) ? 1.0f : 0.0f, (c == 2 || c == 4 || c == 5) ? 1.0f : 0.0f);\n"
+"    QOut o; o.pos = float4(p.x - 1.0f, p.y * 2.0f - 1.0f, 0.0f, 1.0f); o.uv = p; return o;\n"
+"}\n"
+"fragment float4 f_cube(QOut in [[stage_in]], texturecube<float> cube [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    bool right = in.uv.x >= 0.5f, bottom = in.uv.y >= 0.5f;\n"
+"    float3 d = !bottom ? (!right ? float3(1, 0, 0) : float3(-1, 0, 0)) : (!right ? float3(0, 1, 0) : float3(0, 0, -1));\n"
+"    return cube.sample(s, d);\n"
+"}\n"
+"struct Two { float4 a [[color(0)]]; float4 b [[color(1)]]; };\n"
+"fragment Two f_two(QOut in [[stage_in]]) {\n"
+"    Two o; o.a = float4(1.0f, 0.0f, 0.0f, 1.0f); o.b = float4(0.0f, 1.0f, 0.0f, 1.0f); return o;\n"
+"}\n"
+"fragment float4 f_green(QOut in [[stage_in]]) { return float4(0.0f, 1.0f, 0.0f, 1.0f); }\n"
+"fragment float4 f_blue(QOut in [[stage_in]]) { return float4(0.0f, 0.0f, 1.0f, 1.0f); }\n"
+"fragment float4 f_layer(QOut in [[stage_in]], texture2d_array<float> arr [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    return arr.sample(s, in.uv, 2);\n"
+"}\n"
+"fragment float4 f_fetch(QOut in [[stage_in]], float4 dst [[color(0)]]) {\n"
+"    return float4(1.0f - dst.rgb, 1.0f);\n"
+"}\n";
+
+/* how many of a 64x64 RGBA8 target's pixels in [x0,x1) x [y0,y1) are off r g b (one step allowed); the first such one */
+static unsigned
+features_off(const unsigned char *px, unsigned x0, unsigned x1, unsigned y0, unsigned y1, unsigned r, unsigned g, unsigned b,
+    NSString **first)
+{
+	unsigned wrong = 0;
+
+	for (unsigned y = y0; y < y1; y++) {
+		for (unsigned x = x0; x < x1; x++) {
+			const unsigned char *p = px + (y * 64 + x) * 4;
+
+			if ((abs((int)p[0] - (int)r) > 1 || abs((int)p[1] - (int)g) > 1 || abs((int)p[2] - (int)b) > 1) &&
+			    wrong++ == 0 && first != NULL) {
+				*first = [NSString stringWithFormat:@"(%u,%u) %u %u %u", x, y, p[0], p[1], p[2]];
+			}
+		}
+	}
+	return wrong;
+}
+
+static void
+test_metal_features(MetalTest *t)
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLCommandQueue> queue;
+	NSMutableArray<NSString *> *bad = [NSMutableArray array], *good = [NSMutableArray array];
+	MTLTextureDescriptor *rt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64
+	    height:64 mipmapped:NO];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	id<MTLSamplerState> nearest;
+	unsigned char px[64 * 64 * 4];
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kFeaturesSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	queue = [g_device newCommandQueue];
+	rt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	nearest = [g_device newSamplerStateWithDescriptor:sd];
+
+	/* a pipeline of v_full (or another vertex function) and a fragment function, one or two RGBA8 targets, optionally
+	 * with a depth/stencil format; nil and a sentence into bad when refused */
+	id<MTLRenderPipelineState> (^pipe)(NSString *, NSString *, NSString *, unsigned, MTLPixelFormat) =
+	    ^id<MTLRenderPipelineState>(NSString *what, NSString *vertex, NSString *fragment, unsigned colors, MTLPixelFormat zs) {
+		    MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+		    NSError *e = nil;
+		    id<MTLRenderPipelineState> s;
+
+		    p.vertexFunction = [lib newFunctionWithName:vertex];
+		    p.fragmentFunction = [lib newFunctionWithName:fragment];
+		    for (unsigned i = 0; i < colors; i++) {
+			    p.colorAttachments[i].pixelFormat = MTLPixelFormatRGBA8Unorm;
+		    }
+		    p.depthAttachmentPixelFormat = zs;
+		    p.stencilAttachmentPixelFormat = zs;
+		    if ((s = [g_device newRenderPipelineStateWithDescriptor:p error:&e]) == nil) {
+			    [bad addObject:[NSString stringWithFormat:@"%@: the pipeline was refused: %@", what,
+				e.localizedDescription ?: @"nil, no error"]];
+		    }
+		    return s;
+	    };
+	/* a pass over `targets` (cleared to `clear`), `draw` making its draws; NO and a sentence when it did not complete */
+	BOOL (^pass)(NSString *, NSArray<id<MTLTexture>> *, id<MTLTexture>, MTLClearColor, void (^)(id<MTLRenderCommandEncoder>)) =
+	    ^BOOL(NSString *what, NSArray<id<MTLTexture>> *targets, id<MTLTexture> zs, MTLClearColor clear,
+		void (^draw)(id<MTLRenderCommandEncoder>)) {
+		    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+		    id<MTLCommandBuffer> b = [queue commandBuffer];
+		    id<MTLRenderCommandEncoder> e;
+		    NSString *problem = nil;
+
+		    for (NSUInteger i = 0; i < targets.count; i++) {
+			    d.colorAttachments[i].texture = targets[i];
+			    d.colorAttachments[i].loadAction = MTLLoadActionClear;
+			    d.colorAttachments[i].storeAction = MTLStoreActionStore;
+			    d.colorAttachments[i].clearColor = clear;
+		    }
+		    if (zs != nil) {
+			    d.depthAttachment.texture = zs;
+			    d.depthAttachment.loadAction = MTLLoadActionClear;
+			    d.depthAttachment.clearDepth = 1.0;
+			    d.depthAttachment.storeAction = MTLStoreActionDontCare;
+			    d.stencilAttachment.texture = zs;
+			    d.stencilAttachment.loadAction = MTLLoadActionClear;
+			    d.stencilAttachment.clearStencil = 0;
+			    d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+		    }
+		    e = [b renderCommandEncoderWithDescriptor:d];
+		    draw(e);
+		    [e endEncoding];
+		    if (!finish(b, &problem)) {
+			    [bad addObject:[NSString stringWithFormat:@"%@: %@", what, problem]];
+			    return NO;
+		    }
+		    return YES;
+	    };
+
+	/* 1. a cube map, its six faces six colours, sampled along +X, -X, +Y and -Z */
+	{
+		static const unsigned face[6][3] = { { 200, 30, 30 }, { 30, 200, 30 }, { 30, 30, 200 }, { 200, 200, 30 },
+			{ 200, 30, 200 }, { 30, 200, 200 } };
+		MTLTextureDescriptor *cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm size:8
+		    mipmapped:NO];
+		id<MTLTexture> cube = [g_device newTextureWithDescriptor:cd], target = [g_device newTextureWithDescriptor:rt];
+		id<MTLRenderPipelineState> s = pipe(@"cube map", @"v_full", @"f_cube", 1, MTLPixelFormatInvalid);
+		unsigned char fill[8 * 8 * 4];
+
+		for (unsigned f = 0; f < 6; f++) {
+			for (unsigned i = 0; i < 64; i++) {
+				fill[i * 4] = (unsigned char)face[f][0];
+				fill[i * 4 + 1] = (unsigned char)face[f][1];
+				fill[i * 4 + 2] = (unsigned char)face[f][2];
+				fill[i * 4 + 3] = 255;
+			}
+			[cube replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 slice:f withBytes:fill bytesPerRow:32
+			      bytesPerImage:256];
+		}
+		if (s != nil && pass(@"cube map", @[ target ], nil, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+			    [e setRenderPipelineState:s];
+			    [e setFragmentTexture:cube atIndex:0];
+			    [e setFragmentSamplerState:nearest atIndex:0];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    })) {
+			NSString *first = nil;
+			unsigned wrong;
+
+			[target getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			wrong = features_off(px, 2, 30, 2, 30, face[0][0], face[0][1], face[0][2], &first) +
+			    features_off(px, 34, 62, 2, 30, face[1][0], face[1][1], face[1][2], &first) +
+			    features_off(px, 2, 30, 34, 62, face[2][0], face[2][1], face[2][2], &first) +
+			    features_off(px, 34, 62, 34, 62, face[5][0], face[5][1], face[5][2], &first);
+			if (wrong == 0) {
+				[good addObject:@"cube map"];
+			} else {
+				[bad addObject:[NSString stringWithFormat:@"cube map: %u of 3136 pixels off the faces' colours, the first %@ "
+				    "(+X 200 30 30 / -X 30 200 30 / +Y 30 30 200 / -Z 30 200 200 by quarter)", wrong, first]];
+			}
+		}
+	}
+	/* 2. two colour attachments from one pass */
+	{
+		id<MTLTexture> a = [g_device newTextureWithDescriptor:rt], b = [g_device newTextureWithDescriptor:rt];
+		id<MTLRenderPipelineState> s = pipe(@"two attachments", @"v_full", @"f_two", 2, MTLPixelFormatInvalid);
+
+		if (s != nil && pass(@"two attachments", @[ a, b ], nil, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+			    [e setRenderPipelineState:s];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    })) {
+			NSString *first = nil;
+			unsigned wrong;
+
+			[a getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			wrong = features_off(px, 0, 64, 0, 64, 255, 0, 0, &first);
+			[b getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			wrong += features_off(px, 0, 64, 0, 64, 0, 255, 0, &first);
+			if (wrong == 0) {
+				[good addObject:@"two attachments"];
+			} else {
+				[bad addObject:[NSString stringWithFormat:@"two attachments: %u of 8192 pixels wrong, the first %@ (red in the "
+				    "first, green in the second)", wrong, first]];
+			}
+		}
+	}
+	/* 3. a stencil written by one draw (the left half, colour green) and tested by the next (blue where it is 1) */
+	{
+		MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+		    width:64 height:64 mipmapped:NO];
+		MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+		id<MTLTexture> target = [g_device newTextureWithDescriptor:rt], zs;
+		id<MTLRenderPipelineState> green = pipe(@"stencil", @"v_left", @"f_green", 1, MTLPixelFormatDepth32Float_Stencil8),
+		    blue = pipe(@"stencil", @"v_full", @"f_blue", 1, MTLPixelFormatDepth32Float_Stencil8);
+		id<MTLDepthStencilState> write, test;
+
+		zd.usage = MTLTextureUsageRenderTarget;
+		zd.storageMode = MTLStorageModePrivate;
+		zs = [g_device newTextureWithDescriptor:zd];
+		dd.depthCompareFunction = MTLCompareFunctionAlways;
+		dd.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionAlways;
+		dd.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+		dd.backFaceStencil = dd.frontFaceStencil;
+		write = [g_device newDepthStencilStateWithDescriptor:dd];
+		dd.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+		dd.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationKeep;
+		dd.backFaceStencil = dd.frontFaceStencil;
+		test = [g_device newDepthStencilStateWithDescriptor:dd];
+		if (zs == nil) {
+			[bad addObject:@"stencil: no Depth32Float_Stencil8 texture"];
+		} else if (green != nil && blue != nil &&
+		    pass(@"stencil", @[ target ], zs, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+			    [e setStencilReferenceValue:1];
+			    [e setRenderPipelineState:green];
+			    [e setDepthStencilState:write];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+			    [e setRenderPipelineState:blue];
+			    [e setDepthStencilState:test];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    })) {
+			NSString *first = nil;
+			unsigned wrong;
+
+			[target getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			wrong = features_off(px, 0, 31, 0, 64, 0, 0, 255, &first) + features_off(px, 33, 64, 0, 64, 0, 0, 0, &first);
+			if (wrong == 0) {
+				[good addObject:@"stencil"];
+			} else {
+				[bad addObject:[NSString stringWithFormat:@"stencil: %u of 3968 pixels wrong, the first %@ (blue on the left "
+				    "where the stencil was written, black on the right)", wrong, first]];
+			}
+		}
+	}
+	/* 4. layer 2 of a three-layer 2D texture array */
+	{
+		MTLTextureDescriptor *ad = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4
+		    height:4 mipmapped:NO];
+		id<MTLTexture> arr, target = [g_device newTextureWithDescriptor:rt];
+		id<MTLRenderPipelineState> s = pipe(@"texture array", @"v_full", @"f_layer", 1, MTLPixelFormatInvalid);
+		unsigned char fill[4 * 4 * 4];
+
+		ad.textureType = MTLTextureType2DArray;
+		ad.arrayLength = 3;
+		arr = [g_device newTextureWithDescriptor:ad];
+		for (unsigned l = 0; l < 3; l++) {
+			for (unsigned i = 0; i < 16; i++) {
+				fill[i * 4] = (unsigned char)(l == 2 ? 40 : 250);
+				fill[i * 4 + 1] = (unsigned char)(l == 2 ? 160 : 250);
+				fill[i * 4 + 2] = (unsigned char)(l == 2 ? 220 : 250);
+				fill[i * 4 + 3] = 255;
+			}
+			[arr replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 slice:l withBytes:fill bytesPerRow:16 bytesPerImage:64];
+		}
+		if (s != nil && pass(@"texture array", @[ target ], nil, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+			    [e setRenderPipelineState:s];
+			    [e setFragmentTexture:arr atIndex:0];
+			    [e setFragmentSamplerState:nearest atIndex:0];
+			    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		    })) {
+			NSString *first = nil;
+			unsigned wrong;
+
+			[target getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			if ((wrong = features_off(px, 0, 64, 0, 64, 40, 160, 220, &first)) == 0) {
+				[good addObject:@"texture array"];
+			} else {
+				[bad addObject:[NSString stringWithFormat:@"texture array: %u of 4096 pixels off layer 2's 40 160 220, the "
+				    "first %@", wrong, first]];
+			}
+		}
+	}
+	/* 5. framebuffer fetch: the cleared colour read back by the fragment shader and inverted */
+	{
+		id<MTLTexture> target = [g_device newTextureWithDescriptor:rt];
+		id<MTLRenderPipelineState> s = pipe(@"framebuffer fetch", @"v_full", @"f_fetch", 1, MTLPixelFormatInvalid);
+
+		if (s != nil && pass(@"framebuffer fetch", @[ target ], nil, MTLClearColorMake(0.25, 0.5, 0.75, 1),
+			^(id<MTLRenderCommandEncoder> e) {
+				[e setRenderPipelineState:s];
+				[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			})) {
+			NSString *first = nil;
+			unsigned wrong;
+
+			[target getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+			if ((wrong = features_off(px, 0, 64, 0, 64, 191, 128, 64, &first)) == 0) {
+				[good addObject:@"framebuffer fetch"];
+			} else {
+				[bad addObject:[NSString stringWithFormat:@"framebuffer fetch: %u of 4096 pixels off 191 128 64 (the clear "
+				    "0.25 0.5 0.75 inverted), the first %@", wrong, first]];
+			}
+		}
+	}
+
+	if (bad.count == 0) {
+		[t pass:@"%@: every pixel", [good componentsJoinedByString:@", "]];
+	} else {
+		if (good.count > 0) {
+			[t note:@"right: %@", [good componentsJoinedByString:@", "]];
+		}
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /* metal.mtkview's delegate: each frame cleared to a colour of its own and presented, counted */
 @interface MetalViewCounter : NSObject <MTKViewDelegate>
 @property (nonatomic) id<MTLCommandQueue> queue;
@@ -4293,6 +4617,7 @@ static const struct {
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
 	{ "metal.engine", test_metal_engine },
+	{ "metal.features", test_metal_features },
 	{ "metal.mapkit", test_metal_mapkit },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
