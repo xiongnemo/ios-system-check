@@ -5020,6 +5020,74 @@ static NSString *const kApiKernel = @
 "using namespace metal;\n"
 "kernel void k_api(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = i; }\n";
 
+/*
+ * A command buffer with no handler and nobody waiting, its -status polled as an engine's frame pacing does: it must
+ * come to Completed (the driver saw such a buffer finished only with metal_stats=1 until 11-09), its work right, and
+ * its kernel and GPU times in order (Metal's base class answered 0 for them).
+ */
+static void
+test_metal_status(MetalTest *t)
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLFunction> kernel;
+	id<MTLComputePipelineState> pipe;
+	id<MTLBuffer> out;
+	id<MTLCommandBuffer> buffer;
+	id<MTLComputeCommandEncoder> e;
+	CFAbsoluteTime began;
+	CFTimeInterval ks, ke, gs, ge;
+	const uint32_t *o;
+	unsigned wrong = 0;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	lib = [g_device newLibraryWithSource:kApiKernel options:nil error:&error];
+	kernel = [lib newFunctionWithName:@"k_api"];
+	pipe = kernel != nil ? [g_device newComputePipelineStateWithFunction:kernel error:&error] : nil;
+	if (pipe == nil) {
+		[t fail:@"the kernel did not build: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	out = [g_device newBufferWithLength:4096 * 4 options:MTLResourceStorageModeShared];
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	e = [buffer computeCommandEncoder];
+	[e setComputePipelineState:pipe];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e dispatchThreadgroups:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[e endEncoding];
+	[buffer commit];
+	began = CFAbsoluteTimeGetCurrent();
+	while (buffer.status != MTLCommandBufferStatusCompleted && buffer.status != MTLCommandBufferStatusError &&
+	    CFAbsoluteTimeGetCurrent() - began < 3.0) {
+		usleep(500);
+	}
+	if (buffer.status != MTLCommandBufferStatusCompleted) {
+		[t fail:@"status %ld after %.1f s of polling (no handler, no wait): never Completed", (long)buffer.status,
+		    CFAbsoluteTimeGetCurrent() - began];
+		return;
+	}
+	o = out.contents;
+	for (uint32_t i = 0; i < 4096; i++) {
+		wrong += o[i] != i;
+	}
+	ks = buffer.kernelStartTime;
+	ke = buffer.kernelEndTime;
+	gs = buffer.GPUStartTime;
+	ge = buffer.GPUEndTime;
+	if (wrong != 0) {
+		[t fail:@"Completed, but %u of 4096 values wrong", wrong];
+	} else if (ks <= 0 || ke < ks || gs < ke || ge < gs) {
+		[t fail:@"Completed, but the times are not in order: kernel %.6f..%.6f, GPU %.6f..%.6f", ks, ke, gs, ge];
+	} else {
+		[t pass:@"Completed by polling after %.2f ms, 4096 values right; kernel %.3f ms, GPU %.3f ms from %.3f ms after "
+		    "the commit", (CFAbsoluteTimeGetCurrent() - began) * 1000.0, (ke - ks) * 1000.0, (ge - gs) * 1000.0,
+		    (gs - ks) * 1000.0];
+	}
+}
+
 /* Every kind of object an engine makes in its first frame, asked what of its protocol it answers (no pixels: notes) */
 static void
 test_metal_api(MetalTest *t)
@@ -5237,6 +5305,7 @@ static const struct {
 	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
 	{ "metal.swizzle", test_metal_swizzle },
+	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
