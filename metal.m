@@ -2706,6 +2706,242 @@ test_metal_blit_copy(MetalTest *t)
 	}
 }
 
+/* every texel of one level and slice of an RGBA8 texture against r g b 255 (one step of rounding allowed); a sentence
+ * into `bad` when any is off */
+static void
+expect_texels(NSMutableArray<NSString *> *bad, NSString *what, id<MTLTexture> texture, NSUInteger level, NSUInteger slice,
+    unsigned r, unsigned g, unsigned b)
+{
+	NSUInteger w = MAX(texture.width >> level, 1u), h = MAX(texture.height >> level, 1u);
+	unsigned char *px = calloc(w * h, 4);
+	const unsigned want[4] = { r, g, b, 255 };
+	unsigned wrong = 0;
+	NSString *first = nil;
+
+	[texture getBytes:px bytesPerRow:w * 4 bytesPerImage:w * h * 4 fromRegion:MTLRegionMake2D(0, 0, w, h)
+	      mipmapLevel:level slice:slice];
+	for (NSUInteger i = 0; i < w * h; i++) {
+		const unsigned char *p = px + i * 4;
+		BOOL off = NO;
+
+		for (unsigned c = 0; c < 4; c++) {
+			off |= abs((int)p[c] - (int)want[c]) > 1;
+		}
+		if (off && wrong++ == 0) {
+			first = [NSString stringWithFormat:@"(%lu,%lu) %u %u %u %u", (unsigned long)(i % w), (unsigned long)(i / w), p[0],
+			    p[1], p[2], p[3]];
+		}
+	}
+	free(px);
+	if (wrong != 0) {
+		[bad addObject:[NSString stringWithFormat:@"%@: %u of %lu texels wrong, %@ (wanted %u %u %u 255)", what, wrong,
+		    (unsigned long)(w * h), first, r, g, b]];
+	}
+}
+
+/*
+ * Parts of a texture: passes into one level and into one face, and views of a range of levels or slices (on the K40
+ * port until 11-09 a view was of the whole texture or nil, and a pass drew into level 0, slice 0 whatever its
+ * attachment said). A 32x32 RGBA8 mip chain, each level filled with its own colour: level 2 cleared green by a pass,
+ * f_solid drawn into level 1, every level read back; a view of levels 1-2 reads them as its 0-1; the system's
+ * BlitKernel_Unorm copies a view of level 2 into a view of level 3. A 16x16 cube: six passes, one per face, read back
+ * per face, through a 2D view of face 3 and a 2D-array view of the six.
+ */
+static void
+test_metal_view_range(MetalTest *t)
+{
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32
+	    height:32 mipmapped:YES];
+	MTLTextureDescriptor *cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm size:16
+	    mipmapped:NO];
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	NSMutableArray<NSString *> *notes = [NSMutableArray array];
+	id<MTLTexture> chain, cube, levels12, face3, faces;
+	id<MTLCommandQueue> queue;
+	id<MTLCommandBuffer> buffer;
+	MTLRenderPassDescriptor *pass;
+	id<MTLRenderCommandEncoder> encoder;
+	NSString *problem = nil;
+	NSError *error = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+	cd.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	chain = [g_device newTextureWithDescriptor:d];
+	cube = [g_device newTextureWithDescriptor:cd];
+	if (chain == nil || cube == nil || chain.mipmapLevelCount != 6) {
+		[t fail:@"no textures (a 32x32 RGBA8 chain: %@, %lu levels; a 16x16 cube: %@)", chain, (unsigned long)chain.mipmapLevelCount,
+		    cube];
+		return;
+	}
+	for (NSUInteger level = 0; level < 6; level++) {
+		NSUInteger s = 32 >> level;
+		unsigned char *px = malloc(s * s * 4);
+
+		for (NSUInteger i = 0; i < s * s; i++) {
+			px[i * 4] = (unsigned char)(level * 40 + 10);
+			px[i * 4 + 1] = 7;
+			px[i * 4 + 2] = 9;
+			px[i * 4 + 3] = 255;
+		}
+		[chain replaceRegion:MTLRegionMake2D(0, 0, s, s) mipmapLevel:level withBytes:px bytesPerRow:s * 4];
+		free(px);
+	}
+
+	queue = [g_device newCommandQueue];
+	buffer = [queue commandBuffer];
+	/* level 2 cleared green, a pass with no draw */
+	pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = chain;
+	pass.colorAttachments[0].level = 2;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 1, 0, 1);
+	[[buffer renderCommandEncoderWithDescriptor:pass] endEncoding];
+	/* f_solid magenta drawn over all of level 1 */
+	if (g_ours != nil) {
+		MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+		id<MTLRenderPipelineState> pipeline;
+		const float magenta[4] = { 1, 0, 1, 1 };
+
+		p.vertexFunction = [g_ours newFunctionWithName:@"v_fullscreen"];
+		p.fragmentFunction = [g_ours newFunctionWithName:@"f_solid"];
+		p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+		if ((pipeline = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+			[t fail:@"no pipeline (v_fullscreen + f_solid): %@", error.localizedDescription ?: @"nil, no error"];
+			return;
+		}
+		pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = chain;
+		pass.colorAttachments[0].level = 1;
+		pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		encoder = [buffer renderCommandEncoderWithDescriptor:pass];
+		[encoder setRenderPipelineState:pipeline];
+		[encoder setFragmentBytes:magenta length:sizeof(magenta) atIndex:0];
+		[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[encoder endEncoding];
+	} else {
+		[notes addObject:@"no draw into level 1 (no alioth-tests.metallib)"];
+	}
+	/* one pass a face of the cube, each its own colour */
+	for (NSUInteger face = 0; face < 6; face++) {
+		pass = [MTLRenderPassDescriptor renderPassDescriptor];
+		pass.colorAttachments[0].texture = cube;
+		pass.colorAttachments[0].slice = face;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake((face * 40 + 10) / 255.0, (250 - face * 40) / 255.0,
+		    128 / 255.0, 1);
+		[[buffer renderCommandEncoderWithDescriptor:pass] endEncoding];
+	}
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+
+	expect_texels(bad, @"level 0 (untouched)", chain, 0, 0, 10, 7, 9);
+	if (g_ours != nil) {
+		expect_texels(bad, @"level 1 (drawn magenta)", chain, 1, 0, 255, 0, 255);
+	}
+	expect_texels(bad, @"level 2 (cleared green)", chain, 2, 0, 0, 255, 0);
+	expect_texels(bad, @"level 3 (untouched)", chain, 3, 0, 130, 7, 9);
+	for (NSUInteger face = 0; face < 6; face++) {
+		expect_texels(bad, [NSString stringWithFormat:@"cube face %lu", (unsigned long)face], cube, 0, face,
+		    (unsigned)(face * 40 + 10), (unsigned)(250 - face * 40), 128);
+	}
+
+	/* views of a range */
+	levels12 = [chain newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+					      levels:NSMakeRange(1, 2) slices:NSMakeRange(0, 1)];
+	if (levels12 == nil) {
+		[bad addObject:@"a view of levels 1-2: nil"];
+	} else {
+		if (levels12.width != 16 || levels12.mipmapLevelCount != 2 || levels12.parentRelativeLevel != 1 ||
+		    levels12.parentTexture != chain) {
+			[bad addObject:[NSString stringWithFormat:@"the view of levels 1-2 says %lux%lu, %lu levels, parent level %lu, "
+			    "parent %@", (unsigned long)levels12.width, (unsigned long)levels12.height,
+			    (unsigned long)levels12.mipmapLevelCount, (unsigned long)levels12.parentRelativeLevel,
+			    levels12.parentTexture == chain ? @"right" : @"wrong"]];
+		}
+		if (g_ours != nil) {
+			expect_texels(bad, @"the view's level 0 (level 1)", levels12, 0, 0, 255, 0, 255);
+		}
+		expect_texels(bad, @"the view's level 1 (level 2)", levels12, 1, 0, 0, 255, 0);
+	}
+	face3 = [cube newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+					 levels:NSMakeRange(0, 1) slices:NSMakeRange(3, 1)];
+	if (face3 == nil) {
+		[bad addObject:@"a 2D view of cube face 3: nil"];
+	} else {
+		expect_texels(bad, @"the 2D view of face 3", face3, 0, 0, 130, 130, 128);
+		if (face3.parentRelativeSlice != 3) {
+			[bad addObject:[NSString stringWithFormat:@"the view of face 3 says parent slice %lu",
+			    (unsigned long)face3.parentRelativeSlice]];
+		}
+	}
+	faces = [cube newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2DArray
+					 levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 6)];
+	if (faces == nil) {
+		[bad addObject:@"a 2D-array view of the cube: nil"];
+	} else {
+		if (faces.arrayLength != 6) {
+			[bad addObject:[NSString stringWithFormat:@"the 2D-array view says %lu slices", (unsigned long)faces.arrayLength]];
+		}
+		expect_texels(bad, @"slice 4 of the 2D-array view", faces, 0, 4, 170, 90, 128);
+	}
+
+	/* the system's kernel, through views: level 2 (read) into level 3 (written) */
+	{
+		NSData *data = [NSData dataWithContentsOfFile:@AV1SW_LIBRARY];
+		id<MTLLibrary> library = data == nil ? nil : [g_device newLibraryWithData:dispatch_data_create(data.bytes,
+		    data.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT) error:&error];
+		id<MTLFunction> kernel = [library newFunctionWithName:@"BlitKernel_Unorm"];
+		id<MTLComputePipelineState> pipeline = kernel == nil ? nil : [g_device newComputePipelineStateWithFunction:kernel
+		    error:&error];
+		id<MTLTexture> from = [chain newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+							   levels:NSMakeRange(2, 1) slices:NSMakeRange(0, 1)];
+		id<MTLTexture> to = [chain newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+							 levels:NSMakeRange(3, 1) slices:NSMakeRange(0, 1)];
+
+		if (pipeline == nil) {
+			[notes addObject:@"no kernel copy (BlitKernel_Unorm not made)"];
+		} else if (from == nil || to == nil) {
+			[bad addObject:@"views of level 2 and level 3: nil"];
+		} else {
+			id<MTLComputeCommandEncoder> compute;
+
+			buffer = [queue commandBuffer];
+			compute = [buffer computeCommandEncoder];
+			[compute setComputePipelineState:pipeline];
+			[compute setTexture:to atIndex:0];
+			[compute setTexture:from atIndex:1];
+			[compute dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 4, 1)];
+			[compute endEncoding];
+			if (!finish(buffer, &problem)) {
+				[bad addObject:[NSString stringWithFormat:@"the kernel copy: %@", problem]];
+			} else {
+				expect_texels(bad, @"level 3 after the kernel copied the view of level 2 into the view of level 3", chain,
+				    3, 0, 0, 255, 0);
+				expect_texels(bad, @"level 4 (untouched by the copy)", chain, 4, 0, 170, 7, 9);
+			}
+		}
+	}
+
+	if (notes.count > 0) {
+		[t note:@"%@", [notes componentsJoinedByString:@"; "]];
+	}
+	if (bad.count == 0) {
+		[t pass:@"a pass into mip level 2 (cleared) and level 1 (drawn), six into a cube's faces, views of levels 1-2, of face "
+		    "3 and of the six as a 2D array, and a kernel from a view of level 2 into a view of level 3: every texel"];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /*
  * SpriteKit on this device: SKRenderer, given it, draws a magenta square in the middle of a black 64x64 target, read
  * back. (Not an SKView: that takes MTLCreateSystemDefaultDevice()'s device, which is nil until the system itself finds
@@ -3105,6 +3341,7 @@ static const struct {
 	{ "metal.constants", test_metal_constants },
 	{ "metal.blit", test_metal_blit },
 	{ "metal.blit.copy", test_metal_blit_copy },
+	{ "metal.view.range", test_metal_view_range },
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
