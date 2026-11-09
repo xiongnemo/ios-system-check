@@ -8,7 +8,10 @@
 // and their lines on /dev/console ("gpucheck: ...", "metalcheck: ...", "videocheck: ...") are what they were in the
 // separate applications. build.sh builds it into SystemCheck.ipa (mkicon.py its icon).
 #import "check.h"
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/ucontext.h>
 
 #pragma mark the crash handler
 
@@ -17,10 +20,70 @@
 static void (*g_on_signal[HOOKS])(int);
 static void (*g_on_exception[HOOKS])(NSException *);
 static int g_hooks;
+static int g_crash_console = -1;
+
+/* " image+0xoffset" (or " 0xaddress" where no image holds it) appended to line at *n */
+static void
+crash_name(char *line, size_t size, int *n, uintptr_t address)
+{
+	Dl_info info;
+
+	/* (a return address saved by arm64e code carries its pointer signature above the address bits) */
+	address &= 0x0000000fffffffffUL;
+	if (*n >= (int)size) {
+		return;
+	}
+	if (address != 0 && dladdr((const void *)address, &info) && info.dli_fname != NULL) {
+		const char *base = strrchr(info.dli_fname, '/');
+
+		*n += snprintf(line + *n, size - (size_t)*n, " %s+%#lx", base != NULL ? base + 1 : info.dli_fname,
+		    (unsigned long)(address - (uintptr_t)info.dli_fbase));
+	} else {
+		*n += snprintf(line + *n, size - (size_t)*n, " %#lx", (unsigned long)address);
+	}
+}
+
+/*
+ * Where the crash was, by image: pc, lr and the frame chain as "image+offset", one line on /dev/console. The kernel's
+ * fault line gives the same addresses bare, and a library outside the shared cache moves every launch, so a crash in
+ * one of the port's own libraries could not be named afterwards (a Core Image crash in the GL library, 2026-11-09).
+ * dladdr is not async-signal-safe; this runs once, on the way down.
+ */
+static void
+crash_where(int signal, void *context)
+{
+	ucontext_t *uc = context;
+	char line[1024];
+	int n;
+	uintptr_t fp;
+
+	if (uc == NULL || uc->uc_mcontext == NULL || g_crash_console < 0) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "systemcheck: crash: signal %d at pc", signal);
+	crash_name(line, sizeof(line), &n, (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss));
+	n += n < (int)sizeof(line) ? snprintf(line + n, sizeof(line) - (size_t)n, ", lr") : 0;
+	crash_name(line, sizeof(line), &n, (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss));
+	n += n < (int)sizeof(line) ? snprintf(line + n, sizeof(line) - (size_t)n, ", frames") : 0;
+	fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+	for (int i = 0; i < 12 && fp != 0 && (fp & 7) == 0; i++) {
+		const uintptr_t *frame = (const uintptr_t *)fp;
+
+		crash_name(line, sizeof(line), &n, frame[1]);
+		fp = frame[0] & 0x0000000fffffffffUL;
+	}
+	if (n > (int)sizeof(line) - 2) {
+		n = (int)sizeof(line) - 2;
+	}
+	line[n++] = '\n';
+	(void)write(g_crash_console, line, (size_t)n);
+}
 
 static void
 crash_signal(int signal, siginfo_t *info, void *context)
 {
+	(void)info;
+	crash_where(signal, context);
 	for (int i = 0; i < g_hooks; i++) {
 		if (g_on_signal[i] != NULL) {
 			g_on_signal[i](signal);
@@ -52,6 +115,7 @@ check_watch_crashes(void (*on_signal)(int signal), void (*on_exception)(NSExcept
 
 		/* (a stack of its own: a stack overflow on the main thread is caught too) */
 		(void)sigaltstack(&alternate, NULL);
+		g_crash_console = open("/dev/console", O_WRONLY | O_NOCTTY);
 		memset(&action, 0, sizeof(action));
 		action.sa_sigaction = crash_signal;
 		action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
