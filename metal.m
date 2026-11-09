@@ -4745,6 +4745,437 @@ test_metal_mapkit(MetalTest *t)
 	}
 }
 
+#pragma mark swizzled textures
+
+static NSString *const kSwizzleSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"vertex float4 v_swz(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    return float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n"
+"fragment float4 f_swz(float4 pos [[position]], texture2d<float> t [[texture(0)]]) {\n"
+"    constexpr sampler s(filter::nearest);\n"
+"    return t.sample(s, float2(pos.x / 4.0, 0.5));\n"
+"}\n"
+"fragment float4 f_swz_read(float4 pos [[position]], texture2d<float> t [[texture(0)]]) {\n"
+"    return t.read(uint2(pos.x, 0));\n"
+"}\n";
+
+/* a 4 x 1 texture drawn through `pipe` into a 4 x 1 RGBA8 target, read back: NO and why when it did not run */
+static BOOL
+swizzle_draw(id<MTLRenderPipelineState> pipe, id<MTLTexture> source, unsigned char out[16], NSString **problem)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4
+	    height:1 mipmapped:NO];
+	id<MTLTexture> target;
+	MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+	id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+	id<MTLRenderCommandEncoder> e;
+
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	target = [g_device newTextureWithDescriptor:td];
+	d.colorAttachments[0].texture = target;
+	d.colorAttachments[0].loadAction = MTLLoadActionClear;
+	d.colorAttachments[0].storeAction = MTLStoreActionStore;
+	d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	e = [buffer renderCommandEncoderWithDescriptor:d];
+	[e setRenderPipelineState:pipe];
+	[e setFragmentTexture:source atIndex:0];
+	[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[e endEncoding];
+	if (!finish(buffer, problem)) {
+		return NO;
+	}
+	[target getBytes:out bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0];
+	return YES;
+}
+
+/* what a swizzle channel reads from a texel of four bytes */
+static unsigned char
+swizzle_pick(const unsigned char texel[4], MTLTextureSwizzle s)
+{
+	return s == MTLTextureSwizzleZero ? 0 : s == MTLTextureSwizzleOne ? 255 : texel[s - MTLTextureSwizzleRed];
+}
+
+/*
+ * MTLTextureSwizzleChannels, both ways Metal gives it: two views of an RGBA8 texture (-newTextureViewWithPixelFormat:
+ * ...swizzle:, blue-green-red-alpha and zero-one-alpha-red) and an R8 texture made with MTLTextureDescriptor.swizzle
+ * red-red-red-one (a grey picture out of one channel, what a framework does for a greyscale image) -- each drawn
+ * through sample() and read(), which Metal both swizzles. Until 11-09 the driver ignored every swizzle.
+ */
+static void
+test_metal_swizzle(MetalTest *t)
+{
+	static const unsigned char rgba[16] = { 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160 };
+	static const unsigned char r8[4] = { 64, 128, 192, 255 };
+	const MTLTextureSwizzleChannels swizzles[3] = {
+		MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed,
+		    MTLTextureSwizzleAlpha),
+		MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleAlpha,
+		    MTLTextureSwizzleRed),
+		MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+		    MTLTextureSwizzleOne),
+	};
+	static const char *const names[3] = { "RGBA8 view b-g-r-a", "RGBA8 view 0-1-a-r", "R8 made r-r-r-1" };
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	id<MTLRenderPipelineState> paths[2];
+	MTLTextureDescriptor *td;
+	id<MTLTexture> base, textures[3];
+	NSString *problem = nil;
+	NSMutableArray<NSString *> *wrong = [NSMutableArray array];
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kSwizzleSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	p.vertexFunction = [lib newFunctionWithName:@"v_swz"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_swz"];
+	paths[0] = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_swz_read"];
+	paths[1] = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	if (paths[0] == nil || paths[1] == nil) {
+		[t fail:@"pipelines refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:1 mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	base = [g_device newTextureWithDescriptor:td];
+	[base replaceRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0 withBytes:rgba bytesPerRow:16];
+	for (unsigned i = 0; i < 2; i++) {
+		textures[i] = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+		    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:swizzles[i]];
+	}
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:4 height:1 mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead;
+	td.swizzle = swizzles[2];
+	textures[2] = [g_device newTextureWithDescriptor:td];
+	[textures[2] replaceRegion:MTLRegionMake2D(0, 0, 4, 1) mipmapLevel:0 withBytes:r8 bytesPerRow:4];
+	for (unsigned i = 0; i < 3; i++) {
+		MTLTextureSwizzleChannels said;
+
+		if (textures[i] == nil) {
+			[t fail:@"%s: the device gave nil", names[i]];
+			return;
+		}
+		said = textures[i].swizzle;
+		if (said.red != swizzles[i].red || said.green != swizzles[i].green || said.blue != swizzles[i].blue ||
+		    said.alpha != swizzles[i].alpha) {
+			[wrong addObject:[NSString stringWithFormat:@"%s says swizzle %u %u %u %u", names[i], said.red, said.green,
+			    said.blue, said.alpha]];
+		}
+		for (unsigned path = 0; path < 2; path++) {
+			unsigned char got[16], want[16];
+			unsigned off = 0;
+
+			for (unsigned x = 0; x < 4; x++) {
+				const unsigned char texel[4] = { i < 2 ? rgba[x * 4] : r8[x], i < 2 ? rgba[x * 4 + 1] : 0,
+				    i < 2 ? rgba[x * 4 + 2] : 0, i < 2 ? rgba[x * 4 + 3] : 255 };
+
+				want[x * 4] = swizzle_pick(texel, swizzles[i].red);
+				want[x * 4 + 1] = swizzle_pick(texel, swizzles[i].green);
+				want[x * 4 + 2] = swizzle_pick(texel, swizzles[i].blue);
+				want[x * 4 + 3] = swizzle_pick(texel, swizzles[i].alpha);
+			}
+			if (!swizzle_draw(paths[path], textures[i], got, &problem)) {
+				[t fail:@"%s through %s: %@", names[i], path == 0 ? "sample()" : "read()", problem];
+				return;
+			}
+			for (unsigned k = 0; k < 16; k++) {
+				off += abs((int)got[k] - (int)want[k]) > 1;
+			}
+			if (off != 0) {
+				[wrong addObject:[NSString stringWithFormat:@"%s through %s: texel 0 %u %u %u %u, wanted %u %u %u %u",
+				    names[i], path == 0 ? "sample()" : "read()", got[0], got[1], got[2], got[3], want[0], want[1],
+				    want[2], want[3]]];
+			}
+		}
+	}
+	if (wrong.count == 0) {
+		[t pass:@"three swizzles (two views, one descriptor's), each through sample() and read(): every texel right"];
+	} else {
+		[t fail:@"%@", [wrong componentsJoinedByString:@"; "]];
+	}
+}
+
+#pragma mark what of Metal's API the device's objects answer
+
+/* a protocol's instance methods, required and optional, with those of the protocols it adopts (not NSObject's) */
+static void
+api_methods(Protocol *p, NSMutableSet<NSString *> *into, NSMutableSet<NSString *> *seen)
+{
+	NSString *name = @(protocol_getName(p));
+	Protocol * __unsafe_unretained *adopted;
+	unsigned n = 0;
+
+	if ([seen containsObject:name] || [name isEqualToString:@"NSObject"]) {
+		return;
+	}
+	[seen addObject:name];
+	for (int required = 0; required < 2; required++) {
+		struct objc_method_description *m = protocol_copyMethodDescriptionList(p, required == 1, YES, &n);
+
+		for (unsigned i = 0; i < n; i++) {
+			[into addObject:NSStringFromSelector(m[i].name)];
+		}
+		free(m);
+	}
+	adopted = protocol_copyProtocolList(p, &n);
+	for (unsigned i = 0; i < n; i++) {
+		api_methods(adopted[i], into, seen);
+	}
+	free(adopted);
+}
+
+/* the class, from the object's own up, whose own method list has the selector */
+static Class
+api_owner(Class c, SEL s)
+{
+	for (; c != Nil; c = class_getSuperclass(c)) {
+		unsigned n = 0;
+		Method *m = class_copyMethodList(c, &n);
+		BOOL has = NO;
+
+		for (unsigned i = 0; i < n && !has; i++) {
+			has = method_getName(m[i]) == s;
+		}
+		free(m);
+		if (has) {
+			return c;
+		}
+	}
+	return Nil;
+}
+
+/* names, in notes of at most 900 characters each */
+static void
+api_list(MetalTest *t, const char *protocol, NSString *what, NSArray<NSString *> *names)
+{
+	NSMutableString *line = [NSMutableString string];
+	unsigned part = 1;
+
+	for (NSString *name in names) {
+		if (line.length > 0 && line.length + name.length + 1 > 900) {
+			[t note:@"%s %@ (%u): %@", protocol, what, part++, line];
+			[line setString:@""];
+		}
+		[line appendFormat:@"%@%@", line.length > 0 ? @" " : @"", name];
+	}
+	if (line.length > 0) {
+		[t note:@"%s %@%@: %@", protocol, what, part > 1 ? [NSString stringWithFormat:@" (%u)", part] : @"", line];
+	}
+}
+
+/*
+ * One object against its protocol: each method it does not respond to (an application that sends one stops with
+ * "unrecognized selector"), and each it answers from Metal's own classes rather than the driver's (the driver's
+ * classes are named Alioth...): Metal's base classes answer some with nothing at all (nil, 0) -- the list to read
+ * when a real application misbehaves. counts: protocols, methods, missing, Metal's.
+ */
+static void
+api_census(MetalTest *t, id object, Protocol *p, unsigned counts[4])
+{
+	const char *protocol = p != nil ? protocol_getName(p) : "?";
+	NSMutableSet<NSString *> *methods = [NSMutableSet set], *seen = [NSMutableSet set];
+	NSMutableArray<NSString *> *missing = [NSMutableArray array], *base = [NSMutableArray array];
+	unsigned own = 0;
+
+	if (p == nil || object == nil) {
+		[t note:@"%s: %s", protocol, p == nil ? "no such protocol in this Metal" : "the device gave no object to ask"];
+		return;
+	}
+	api_methods(p, methods, seen);
+	for (NSString *name in [[methods allObjects] sortedArrayUsingSelector:@selector(compare:)]) {
+		SEL s = NSSelectorFromString(name);
+		Class owner;
+
+		if (![object respondsToSelector:s]) {
+			[missing addObject:name];
+		} else if ((owner = api_owner(object_getClass(object), s)) != Nil && strncmp(class_getName(owner), "Alioth", 6) == 0) {
+			own++;
+		} else {
+			[base addObject:name];
+		}
+	}
+	[t note:@"%s, %s: %lu methods: %u the driver's, %lu Metal's own classes', %lu missing", protocol,
+	    class_getName(object_getClass(object)), (unsigned long)methods.count, own, (unsigned long)base.count,
+	    (unsigned long)missing.count];
+	api_list(t, protocol, @"missing", missing);
+	api_list(t, protocol, @"from Metal's own classes", base);
+	counts[0]++;
+	counts[1] += (unsigned)methods.count;
+	counts[2] += (unsigned)missing.count;
+	counts[3] += (unsigned)base.count;
+}
+
+static NSString *const kApiKernel = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_api(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = i; }\n";
+
+/* Every kind of object an engine makes in its first frame, asked what of its protocol it answers (no pixels: notes) */
+static void
+test_metal_api(MetalTest *t)
+{
+	unsigned counts[4] = { 0 };
+	NSError *error = nil;
+	id<MTLCommandQueue> queue;
+	id<MTLCommandBuffer> buffer;
+	id<MTLLibrary> lib, klib;
+	id<MTLFunction> kernel;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16
+	    height:16 mipmapped:NO];
+	id<MTLTexture> target;
+	MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	/* (what an engine reads first: the families answered -- ASTC is Apple2's, for one -- and the profile behind them) */
+	{
+		static const struct { MTLGPUFamily family; const char *name; } families[] = {
+			{ MTLGPUFamilyApple1, "Apple1" }, { MTLGPUFamilyApple2, "Apple2" }, { MTLGPUFamilyApple3, "Apple3" },
+			{ MTLGPUFamilyApple4, "Apple4" }, { MTLGPUFamilyApple5, "Apple5" }, { MTLGPUFamilyApple6, "Apple6" },
+			{ MTLGPUFamilyApple7, "Apple7" }, { MTLGPUFamilyApple8, "Apple8" }, { MTLGPUFamilyCommon1, "Common1" },
+			{ MTLGPUFamilyCommon2, "Common2" }, { MTLGPUFamilyCommon3, "Common3" }, { MTLGPUFamilyMac2, "Mac2" },
+			{ MTLGPUFamilyMetal3, "Metal3" },
+		};
+		NSMutableArray<NSString *> *yes = [NSMutableArray array];
+		SEL profile = NSSelectorFromString(@"featureProfile");
+
+		for (unsigned i = 0; i < sizeof(families) / sizeof(families[0]) &&
+		    [g_device respondsToSelector:@selector(supportsFamily:)]; i++) {
+			if ([g_device supportsFamily:families[i].family]) {
+				[yes addObject:@(families[i].name)];
+			}
+		}
+		/* (each asked only when answered: a missing one would stop the test, which the census below reports) */
+		[t note:@"families answered: %@ (feature profile %@); argument buffers tier %@, read-write textures tier %@, "
+		    "raster order groups %@", yes.count ? [yes componentsJoinedByString:@" "] : @"none",
+		    [g_device respondsToSelector:profile] ? [NSString stringWithFormat:@"%lu",
+		    ((NSUInteger (*)(id, SEL))objc_msgSend)(g_device, profile)] : @"not said",
+		    [g_device respondsToSelector:@selector(argumentBuffersSupport)] ? [NSString stringWithFormat:@"%lu",
+		    (unsigned long)g_device.argumentBuffersSupport] : @"not said",
+		    [g_device respondsToSelector:@selector(readWriteTextureSupport)] ? [NSString stringWithFormat:@"%lu",
+		    (unsigned long)g_device.readWriteTextureSupport] : @"not said",
+		    [g_device respondsToSelector:@selector(areRasterOrderGroupsSupported)] ?
+		    (g_device.rasterOrderGroupsSupported ? @"yes" : @"no") : @"not said"];
+	}
+	api_census(t, g_device, @protocol(MTLDevice), counts);
+	queue = [g_device newCommandQueue];
+	api_census(t, queue, @protocol(MTLCommandQueue), counts);
+	buffer = [queue commandBuffer];
+	api_census(t, buffer, @protocol(MTLCommandBuffer), counts);
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	target = [g_device newTextureWithDescriptor:td];
+	api_census(t, target, @protocol(MTLTexture), counts);
+	api_census(t, [g_device newBufferWithLength:256 options:MTLResourceStorageModeShared], @protocol(MTLBuffer), counts);
+	api_census(t, [g_device newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]], @protocol(MTLSamplerState), counts);
+	api_census(t, [g_device newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]], @protocol(MTLDepthStencilState), counts);
+	hd.size = 1 << 20;
+	api_census(t, [g_device newHeapWithDescriptor:hd], @protocol(MTLHeap), counts);
+	api_census(t, [g_device newFence], @protocol(MTLFence), counts);
+	api_census(t, [g_device newEvent], @protocol(MTLEvent), counts);
+	api_census(t, [g_device newSharedEvent], @protocol(MTLSharedEvent), counts);
+	lib = [g_device newLibraryWithSource:kFeaturesSource options:nil error:&error];
+	api_census(t, lib, @protocol(MTLLibrary), counts);
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	p.vertexFunction = [lib newFunctionWithName:@"v_left"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_red"];
+	api_census(t, p.vertexFunction, @protocol(MTLFunction), counts);
+	api_census(t, p.vertexFunction != nil ? [g_device newRenderPipelineStateWithDescriptor:p error:&error] : nil,
+	    @protocol(MTLRenderPipelineState), counts);
+	klib = [g_device newLibraryWithSource:kApiKernel options:nil error:&error];
+	kernel = [klib newFunctionWithName:@"k_api"];
+	api_census(t, kernel != nil ? [g_device newComputePipelineStateWithFunction:kernel error:&error] : nil,
+	    @protocol(MTLComputePipelineState), counts);
+	d.colorAttachments[0].texture = target;
+	d.colorAttachments[0].loadAction = MTLLoadActionClear;
+	d.colorAttachments[0].storeAction = MTLStoreActionStore;
+	{
+		id<MTLRenderCommandEncoder> e = [buffer renderCommandEncoderWithDescriptor:d];
+
+		api_census(t, e, @protocol(MTLRenderCommandEncoder), counts);
+		[e endEncoding];
+	}
+	{
+		id<MTLComputeCommandEncoder> e = [buffer computeCommandEncoder];
+
+		api_census(t, e, @protocol(MTLComputeCommandEncoder), counts);
+		[e endEncoding];
+	}
+	{
+		id<MTLBlitCommandEncoder> e = [buffer blitCommandEncoder];
+
+		api_census(t, e, @protocol(MTLBlitCommandEncoder), counts);
+		[e endEncoding];
+	}
+	{
+		id<MTLParallelRenderCommandEncoder> e = [buffer parallelRenderCommandEncoderWithDescriptor:d];
+		id<MTLRenderCommandEncoder> sub = [e renderCommandEncoder];
+
+		api_census(t, e, @protocol(MTLParallelRenderCommandEncoder), counts);
+		[sub endEncoding];
+		[e endEncoding];
+	}
+	/*
+	 * What the constructors Metal's own classes answer give (nil is what an engine would trip over), one note each as
+	 * it comes, so that a crash in one of them leaves the ones before it written down; then the driver's own ICB.
+	 */
+	{
+		NSError *e2 = nil;
+		MTLArgumentDescriptor *a = [MTLArgumentDescriptor argumentDescriptor];
+		MTLIndirectCommandBufferDescriptor *icb = [MTLIndirectCommandBufferDescriptor new];
+		id x;
+
+		x = [buffer computeCommandEncoderWithDescriptor:[MTLComputePassDescriptor computePassDescriptor]];
+		[t note:@"probe -computeCommandEncoderWithDescriptor: %s", x != nil ? object_getClassName(x) : "nil"];
+		[x endEncoding];
+		x = [queue commandBufferWithDescriptor:[MTLCommandBufferDescriptor new]];
+		[t note:@"probe -commandBufferWithDescriptor: %s", x != nil ? object_getClassName(x) : "nil"];
+		x = [g_device newCommandQueueWithMaxCommandBufferCount:16];
+		[t note:@"probe -newCommandQueueWithMaxCommandBufferCount: %s", x != nil ? object_getClassName(x) : "nil"];
+		[t note:@"probe -supportsTextureSampleCount: 2 %d, 4 %d, 8 %d; -minimumLinearTextureAlignmentForPixelFormat: "
+		    "RGBA8 %lu", [g_device supportsTextureSampleCount:2], [g_device supportsTextureSampleCount:4],
+		    [g_device supportsTextureSampleCount:8],
+		    (unsigned long)[g_device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatRGBA8Unorm]];
+		a.dataType = MTLDataTypePointer;
+		a.index = 0;
+		a.access = MTLArgumentAccessReadOnly;
+		x = [g_device newArgumentEncoderWithArguments:@[a]];
+		[t note:@"probe -newArgumentEncoderWithArguments: %s", x != nil ? object_getClassName(x) : "nil"];
+		api_census(t, x, @protocol(MTLArgumentEncoder), counts);
+		icb.commandTypes = MTLIndirectCommandTypeDraw;
+		icb.maxVertexBufferBindCount = 1;
+		icb.maxFragmentBufferBindCount = 1;
+		x = [g_device newIndirectCommandBufferWithDescriptor:icb maxCommandCount:4 options:0];
+		[t note:@"probe -newIndirectCommandBufferWithDescriptor: %s", x != nil ? object_getClassName(x) : "nil"];
+		api_census(t, x, @protocol(MTLIndirectCommandBuffer), counts);
+		x = [g_device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e2];
+		[t note:@"probe -newBinaryArchiveWithDescriptor:error: %s%@", x != nil ? object_getClassName(x) : "nil",
+		    e2 != nil ? [NSString stringWithFormat:@" (%@)", e2.localizedDescription] : @""];
+	}
+	if (!finish(buffer, &problem)) {
+		[t fail:@"the command buffer of the encoders asked did not complete: %@", problem];
+		return;
+	}
+	[t note:@"probe GPUStartTime %.6f GPUEndTime %.6f (seconds, Metal's own class's)", buffer.GPUStartTime,
+	    buffer.GPUEndTime];
+	[t pass:@"%u of Metal's protocols asked: %u methods, %u missing (an application that sends one stops there), "
+	    "%u answered by Metal's own classes (the notes name them)", counts[0], counts[1], counts[2], counts[3]];
+}
+
 static const struct {
 	const char *ident;
 	void (*run)(MetalTest *);
@@ -4805,6 +5236,8 @@ static const struct {
 	{ "metal.features", test_metal_features },
 	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
+	{ "metal.swizzle", test_metal_swizzle },
+	{ "metal.api", test_metal_api },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
 
