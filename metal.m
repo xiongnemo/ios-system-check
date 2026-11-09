@@ -3988,6 +3988,12 @@ static NSString *const kFeaturesSource = @
 "fragment Two f_two(QOut in [[stage_in]]) {\n"
 "    Two o; o.a = float4(1.0f, 0.0f, 0.0f, 1.0f); o.b = float4(0.0f, 1.0f, 0.0f, 1.0f); return o;\n"
 "}\n"
+"vertex QOut v_right(uint vid [[vertex_id]]) {\n"
+"    uint c = vid % 6;\n"
+"    float2 p = float2((c == 1 || c == 2 || c == 4) ? 1.0f : 0.0f, (c == 2 || c == 4 || c == 5) ? 1.0f : 0.0f);\n"
+"    QOut o; o.pos = float4(p.x, p.y * 2.0f - 1.0f, 0.0f, 1.0f); o.uv = p; return o;\n"
+"}\n"
+"fragment float4 f_red(QOut in [[stage_in]]) { return float4(1.0f, 0.0f, 0.0f, 1.0f); }\n"
 "fragment float4 f_green(QOut in [[stage_in]]) { return float4(0.0f, 1.0f, 0.0f, 1.0f); }\n"
 "fragment float4 f_blue(QOut in [[stage_in]]) { return float4(0.0f, 0.0f, 1.0f, 1.0f); }\n"
 "fragment float4 f_layer(QOut in [[stage_in]], texture2d_array<float> arr [[texture(0)]], sampler s [[sampler(0)]]) {\n"
@@ -4279,6 +4285,94 @@ test_metal_features(MetalTest *t)
 			[t note:@"right: %@", [good componentsJoinedByString:@", "]];
 		}
 		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
+/*
+ * A parallel render pass (MTLParallelRenderCommandEncoder, on the K40 port nil until 11-09): two sub-encoders of one
+ * pass, the SECOND made encoding first, on another thread -- the right half green -- and then the first: a clear to blue
+ * (the pass's load action) and the left half red. Metal runs sub-encoders in the order they were made, so the picture
+ * is red | green; run in the order their commands arrived, the first's clear would have wiped the green to blue.
+ */
+static void
+test_metal_parallel(MetalTest *t)
+{
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	id<MTLRenderPipelineState> red, green;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64
+	    height:64 mipmapped:NO];
+	id<MTLTexture> target;
+	MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+	id<MTLCommandBuffer> buffer;
+	id<MTLParallelRenderCommandEncoder> par;
+	id<MTLRenderCommandEncoder> first, second;
+	NSString *problem = nil, *firstOff = nil;
+	unsigned char px[64 * 64 * 4];
+	unsigned wrong;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kFeaturesSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	p.vertexFunction = [lib newFunctionWithName:@"v_left"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_red"];
+	red = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	p.vertexFunction = [lib newFunctionWithName:@"v_right"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_green"];
+	green = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	if (red == nil || green == nil) {
+		[t fail:@"pipelines refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	target = [g_device newTextureWithDescriptor:td];
+	d.colorAttachments[0].texture = target;
+	d.colorAttachments[0].loadAction = MTLLoadActionClear;
+	d.colorAttachments[0].storeAction = MTLStoreActionStore;
+	d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	if ((par = [buffer parallelRenderCommandEncoderWithDescriptor:d]) == nil) {
+		[t fail:@"-parallelRenderCommandEncoderWithDescriptor: gave nil"];
+		return;
+	}
+	first = [par renderCommandEncoder];
+	second = [par renderCommandEncoder];
+	if (first == nil || second == nil) {
+		[t fail:@"-renderCommandEncoder of the parallel encoder gave nil"];
+		return;
+	}
+	{
+		dispatch_group_t g = dispatch_group_create();
+
+		dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			[second setRenderPipelineState:green];
+			[second drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+			[second endEncoding];
+		});
+		dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
+	}
+	[first setRenderPipelineState:red];
+	[first drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[first endEncoding];
+	[par endEncoding];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	[target getBytes:px bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	wrong = features_off(px, 0, 31, 0, 64, 255, 0, 0, &firstOff) + features_off(px, 33, 64, 0, 64, 0, 255, 0, &firstOff);
+	if (wrong == 0) {
+		[t pass:@"two sub-encoders, the second encoded first on another thread: red | green, in the order they were made"];
+	} else {
+		[t fail:@"%u of 3968 pixels wrong, the first %@ (red on the left, green on the right; blue on the right means the "
+		    "sub-encoders ran in the order they encoded)", wrong, firstOff];
 	}
 }
 
@@ -4618,6 +4712,7 @@ static const struct {
 	{ "metal.mtkview", test_metal_mtkview },
 	{ "metal.engine", test_metal_engine },
 	{ "metal.features", test_metal_features },
+	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
