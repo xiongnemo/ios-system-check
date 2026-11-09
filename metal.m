@@ -24,6 +24,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <signal.h>
+#include <simd/simd.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #import "check.h"
@@ -3436,6 +3437,527 @@ test_metal_spritekit(MetalTest *t)
 	}
 }
 
+#pragma mark metal.engine: a game engine's frame, many times
+
+/*
+ * What a game engine's frame asks of a device, all at once and for two seconds, from source compiled here by iOS's own
+ * compiler service: a compute pass moving 1024 particles and writing the indirect arguments of their draw; a depth-only
+ * shadow pass; a 4x MSAA HDR pass (RGBA16Float) of instanced boxes on a ground, lit with a shadow comparison and a
+ * mipmapped albedo, then the particles additively, from those GPU-written arguments, resolved; a bloom chain rendered
+ * into the levels of one texture, each level read through a view of the one above or below it; a tonemapped sRGB
+ * composite. Each frame's uniforms are a buffer of its own, released before the GPU has run it.
+ */
+static NSString *const kEngineSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct Uniforms { float4x4 viewProj; float4x4 lightViewProj; float4 lightDir; float4 params; };\n"
+"struct Particle { float4 pos; float4 vel; };\n"
+"static float2 corner_of(uint vid) {\n"
+"    uint c = vid % 6;\n"
+"    return float2((c == 1 || c == 2 || c == 4) ? 1.0f : -1.0f, (c == 2 || c == 4 || c == 5) ? 1.0f : -1.0f);\n"
+"}\n"
+"static float3 cube_vertex(uint vid, thread float3 &n, thread float2 &uv) {\n"
+"    uint face = vid / 6;\n"
+"    uint axis = face / 2;\n"
+"    float s = (face % 2 == 0) ? 1.0f : -1.0f;\n"
+"    n = float3(axis == 0 ? s : 0.0f, axis == 1 ? s : 0.0f, axis == 2 ? s : 0.0f);\n"
+"    float3 t = axis == 1 ? float3(1.0f, 0.0f, 0.0f) : float3(0.0f, 1.0f, 0.0f);\n"
+"    float3 b = cross(n, t);\n"
+"    float2 c = corner_of(vid);\n"
+"    uv = c * 0.5f + 0.5f;\n"
+"    return n + t * c.x + b * c.y;\n"
+"}\n"
+"static float3 placed(float3 p, uint iid, uint ground) {\n"
+"    if (ground != 0) return p * float3(12.0f, 0.1f, 12.0f) - float3(0.0f, 0.1f, 0.0f);\n"
+"    return p * 0.6f + float3((float(iid % 4) - 1.5f) * 2.5f, 0.6f, (float(iid / 4) - 1.5f) * 2.5f);\n"
+"}\n"
+"kernel void k_particles(device Particle *p [[buffer(0)]], device uint *args [[buffer(1)]],\n"
+"                        constant Uniforms &u [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n"
+"    Particle q = p[id];\n"
+"    float dt = u.params.x;\n"
+"    q.vel.y -= 9.8f * dt;\n"
+"    q.pos.xyz += q.vel.xyz * dt;\n"
+"    if (q.pos.y < 0.0f) { q.pos.y = -q.pos.y; q.vel.y = -q.vel.y * 0.8f; }\n"
+"    p[id] = q;\n"
+"    if (id == 0) { args[0] = 6; args[1] = 1024; args[2] = 0; args[3] = 0; }\n"
+"}\n"
+"vertex float4 v_shadow(uint vid [[vertex_id]], uint iid [[instance_id]], constant Uniforms &u [[buffer(1)]],\n"
+"                       constant uint &ground [[buffer(2)]]) {\n"
+"    float3 n; float2 uv;\n"
+"    return u.lightViewProj * float4(placed(cube_vertex(vid, n, uv), iid, ground), 1.0f);\n"
+"}\n"
+"struct VOut { float4 pos [[position]]; float3 normal; float2 uv; float4 lightPos; };\n"
+"vertex VOut v_main(uint vid [[vertex_id]], uint iid [[instance_id]], constant Uniforms &u [[buffer(1)]],\n"
+"                   constant uint &ground [[buffer(2)]]) {\n"
+"    VOut o; float3 n; float2 uv;\n"
+"    float4 world = float4(placed(cube_vertex(vid, n, uv), iid, ground), 1.0f);\n"
+"    o.pos = u.viewProj * world;\n"
+"    o.normal = n;\n"
+"    o.uv = uv * (ground != 0 ? 8.0f : 1.0f);\n"
+"    o.lightPos = u.lightViewProj * world;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 f_main(VOut in [[stage_in]], texture2d<float> albedo [[texture(0)]], depth2d<float> shadow [[texture(1)]],\n"
+"                       sampler s [[sampler(0)]], constant Uniforms &u [[buffer(0)]]) {\n"
+"    constexpr sampler sc(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);\n"
+"    float3 lp = in.lightPos.xyz / in.lightPos.w;\n"
+"    float2 suv = float2(lp.x * 0.5f + 0.5f, 0.5f - lp.y * 0.5f);\n"
+"    float lit = shadow.sample_compare(sc, suv, lp.z - 0.003f);\n"
+"    float ndl = max(dot(normalize(in.normal), -u.lightDir.xyz), 0.0f);\n"
+"    float3 c = albedo.sample(s, in.uv).rgb;\n"
+"    return float4(c * (0.15f + 1.5f * ndl * lit), 1.0f);\n"
+"}\n"
+"struct POut { float4 pos [[position]]; float2 c; };\n"
+"vertex POut v_particle(uint vid [[vertex_id]], uint iid [[instance_id]], const device Particle *p [[buffer(0)]],\n"
+"                       constant Uniforms &u [[buffer(1)]]) {\n"
+"    POut o;\n"
+"    float2 c = corner_of(vid);\n"
+"    float4 clip = u.viewProj * float4(p[iid].pos.xyz, 1.0f);\n"
+"    clip.xy += c * 0.03f * clip.w;\n"
+"    o.pos = clip;\n"
+"    o.c = c;\n"
+"    return o;\n"
+"}\n"
+"fragment float4 f_particle(POut in [[stage_in]]) {\n"
+"    float d = max(1.0f - length(in.c), 0.0f);\n"
+"    return float4(6.0f, 3.0f, 1.0f, 1.0f) * d;\n"
+"}\n"
+"struct QOut { float4 pos [[position]]; float2 uv; };\n"
+"vertex QOut v_quad(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+"    QOut o;\n"
+"    o.pos = float4(p * 2.0f - 1.0f, 0.0f, 1.0f);\n"
+"    o.uv = float2(p.x, 1.0f - p.y);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 f_down(QOut in [[stage_in]], texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    float2 t = 1.0f / float2(src.get_width(), src.get_height());\n"
+"    float4 c = src.sample(s, in.uv + t * float2(-0.5f, -0.5f)) + src.sample(s, in.uv + t * float2(0.5f, -0.5f)) +\n"
+"               src.sample(s, in.uv + t * float2(-0.5f, 0.5f)) + src.sample(s, in.uv + t * float2(0.5f, 0.5f));\n"
+"    return c * 0.25f;\n"
+"}\n"
+"fragment float4 f_composite(QOut in [[stage_in]], texture2d<float> hdr [[texture(0)]], texture2d<float> bloom [[texture(1)]],\n"
+"                            sampler s [[sampler(0)]]) {\n"
+"    float3 c = hdr.sample(s, in.uv).rgb + 0.6f * bloom.sample(s, in.uv).rgb;\n"
+"    return float4(c / (1.0f + c), 1.0f);\n"
+"}\n";
+
+typedef struct {
+	simd_float4x4 viewProj, lightViewProj;
+	simd_float4 lightDir, params;
+} EngineUniforms;
+
+/* right-handed, looking down -z, depth 0..1 as Metal's */
+static simd_float4x4
+engine_perspective(float fovy, float aspect, float near, float far)
+{
+	float ys = 1.0f / tanf(fovy * 0.5f), xs = ys / aspect, zs = far / (near - far);
+
+	return (simd_float4x4){ { { xs, 0, 0, 0 }, { 0, ys, 0, 0 }, { 0, 0, zs, -1 }, { 0, 0, near * zs, 0 } } };
+}
+
+static simd_float4x4
+engine_ortho(float half, float near, float far)
+{
+	return (simd_float4x4){ { { 1 / half, 0, 0, 0 }, { 0, 1 / half, 0, 0 }, { 0, 0, -1 / (far - near), 0 },
+	    { 0, 0, -near / (far - near), 1 } } };
+}
+
+static simd_float4x4
+engine_look_at(simd_float3 eye, simd_float3 center, simd_float3 up)
+{
+	simd_float3 f = simd_normalize(center - eye), s = simd_normalize(simd_cross(f, up)), u = simd_cross(s, f);
+
+	return (simd_float4x4){ { { s.x, u.x, -f.x, 0 }, { s.y, u.y, -f.y, 0 }, { s.z, u.z, -f.z, 0 },
+	    { -simd_dot(s, eye), -simd_dot(u, eye), simd_dot(f, eye), 1 } } };
+}
+
+static void
+test_metal_engine(MetalTest *t)
+{
+	enum { W = 256, H = 256, BLOOM = 4, PARTICLES = 1024 };
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLCommandQueue> queue;
+	id<MTLComputePipelineState> particles;
+	id<MTLRenderPipelineState> shadowPipe, mainPipe, particlePipe, downPipe, upPipe, compositePipe;
+	id<MTLDepthStencilState> depthWrite, depthRead;
+	id<MTLTexture> shadowMap, msaaColor, msaaDepth, hdr, bloom, albedo, composite, bloomLevel[BLOOM];
+	id<MTLSamplerState> linear, trilinear;
+	id<MTLBuffer> particleBuffer, args;
+	NSMutableArray<id<MTLCommandBuffer>> *inFlight = [NSMutableArray array];
+	__block unsigned failed = 0;
+	__block NSString *firstError = nil;
+	unsigned frames = 0;
+	float firstY;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kEngineSource options:nil error:&error]) == nil) {
+		[t fail:@"the engine's shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	queue = [g_device newCommandQueue];
+
+	/* pipelines; each refusal named (no goto: ARC will not jump past the strong locals below) */
+#define ENGINE_REFUSED(what) do { \
+		[t fail:@"%@ refused: %@", what, error.localizedDescription ?: @"nil, no error"]; \
+		return; \
+	} while (0)
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+
+	particles = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_particles"] error:&error];
+	if (particles == nil) {
+		ENGINE_REFUSED(@"k_particles");
+	}
+	p.vertexFunction = [lib newFunctionWithName:@"v_shadow"];
+	p.fragmentFunction = nil;
+	p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	if ((shadowPipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the depth-only shadow pipeline (no fragment function)");
+	}
+	p = [MTLRenderPipelineDescriptor new];
+	p.vertexFunction = [lib newFunctionWithName:@"v_main"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_main"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+	p.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	p.rasterSampleCount = 4;
+	if ((mainPipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the 4x MSAA main pipeline");
+	}
+	p.vertexFunction = [lib newFunctionWithName:@"v_particle"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_particle"];
+	p.colorAttachments[0].blendingEnabled = YES;
+	p.colorAttachments[0].sourceRGBBlendFactor = p.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	p.colorAttachments[0].destinationRGBBlendFactor = p.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+	if ((particlePipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the additive particle pipeline");
+	}
+	p = [MTLRenderPipelineDescriptor new];
+	p.vertexFunction = [lib newFunctionWithName:@"v_quad"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_down"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+	if ((downPipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the bloom downsample pipeline");
+	}
+	p.colorAttachments[0].blendingEnabled = YES;
+	p.colorAttachments[0].sourceRGBBlendFactor = p.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	p.colorAttachments[0].destinationRGBBlendFactor = p.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+	if ((upPipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the bloom upsample pipeline");
+	}
+	p = [MTLRenderPipelineDescriptor new];
+	p.vertexFunction = [lib newFunctionWithName:@"v_quad"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_composite"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm_sRGB;
+	if ((compositePipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		ENGINE_REFUSED(@"the sRGB composite pipeline");
+	}
+#undef ENGINE_REFUSED
+	{
+		MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+
+		d.depthCompareFunction = MTLCompareFunctionLess;
+		d.depthWriteEnabled = YES;
+		depthWrite = [g_device newDepthStencilStateWithDescriptor:d];
+		d.depthWriteEnabled = NO;
+		depthRead = [g_device newDepthStencilStateWithDescriptor:d];
+	}
+
+	/* textures */
+	{
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:512
+		    height:512 mipmapped:NO];
+
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		d.storageMode = MTLStorageModePrivate;
+		shadowMap = [g_device newTextureWithDescriptor:d];
+		d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:W height:H mipmapped:NO];
+		d.textureType = MTLTextureType2DMultisample;
+		d.sampleCount = 4;
+		d.usage = MTLTextureUsageRenderTarget;
+		d.storageMode = MTLStorageModePrivate;
+		msaaColor = [g_device newTextureWithDescriptor:d];
+		d.pixelFormat = MTLPixelFormatDepth32Float;
+		msaaDepth = [g_device newTextureWithDescriptor:d];
+		d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:W height:H mipmapped:NO];
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		hdr = [g_device newTextureWithDescriptor:d];
+		d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:W / 2 height:H / 2
+		    mipmapped:YES];
+		d.mipmapLevelCount = BLOOM;
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		bloom = [g_device newTextureWithDescriptor:d];
+		d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB width:W height:H
+		    mipmapped:NO];
+		d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		composite = [g_device newTextureWithDescriptor:d];
+		d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:YES];
+		d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+		albedo = [g_device newTextureWithDescriptor:d];
+	}
+	if (shadowMap == nil || msaaColor == nil || msaaDepth == nil || hdr == nil || bloom == nil || composite == nil ||
+	    albedo == nil) {
+		[t fail:@"textures: shadow %@, msaa colour %@, msaa depth %@, hdr %@, bloom %@, composite %@, albedo %@",
+		    shadowMap ? @"ok" : @"nil", msaaColor ? @"ok" : @"nil", msaaDepth ? @"ok" : @"nil", hdr ? @"ok" : @"nil",
+		    bloom ? @"ok" : @"nil", composite ? @"ok" : @"nil", albedo ? @"ok" : @"nil"];
+		return;
+	}
+	for (unsigned k = 0; k < BLOOM; k++) {
+		bloomLevel[k] = [bloom newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float textureType:MTLTextureType2D
+						      levels:NSMakeRange(k, 1) slices:NSMakeRange(0, 1)];
+		if (bloomLevel[k] == nil) {
+			[t fail:@"no view of bloom level %u", k];
+			return;
+		}
+	}
+	{
+		unsigned char *px = malloc(64 * 64 * 4);
+
+		for (unsigned i = 0; i < 64 * 64; i++) {
+			BOOL on = ((i % 64) / 8 + (i / 64) / 8) % 2 == 0;
+
+			px[i * 4] = on ? 230 : 90;
+			px[i * 4 + 1] = on ? 200 : 110;
+			px[i * 4 + 2] = on ? 170 : 140;
+			px[i * 4 + 3] = 255;
+		}
+		[albedo replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:px bytesPerRow:64 * 4];
+		free(px);
+	}
+	{
+		MTLSamplerDescriptor *s = [MTLSamplerDescriptor new];
+
+		s.minFilter = s.magFilter = MTLSamplerMinMagFilterLinear;
+		s.sAddressMode = s.tAddressMode = MTLSamplerAddressModeClampToEdge;
+		linear = [g_device newSamplerStateWithDescriptor:s];
+		s.mipFilter = MTLSamplerMipFilterLinear;
+		s.sAddressMode = s.tAddressMode = MTLSamplerAddressModeRepeat;
+		trilinear = [g_device newSamplerStateWithDescriptor:s];
+	}
+	particleBuffer = [g_device newBufferWithLength:PARTICLES * 32 options:MTLResourceStorageModeShared];
+	args = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+	memset(args.contents, 0, 16);
+	{
+		float *q = particleBuffer.contents;
+
+		srand(7);
+		for (unsigned i = 0; i < PARTICLES; i++, q += 8) {
+			q[0] = (float)(rand() % 1000) / 250.0f - 2.0f;
+			q[1] = 2.0f + (float)(rand() % 1000) / 500.0f;
+			q[2] = (float)(rand() % 1000) / 250.0f - 2.0f;
+			q[4] = (float)(rand() % 1000) / 500.0f - 1.0f;
+			q[5] = (float)(rand() % 1000) / 250.0f;
+			q[6] = (float)(rand() % 1000) / 500.0f - 1.0f;
+		}
+		firstY = ((float *)particleBuffer.contents)[1];
+	}
+	{
+		id<MTLCommandBuffer> b = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> e = [b blitCommandEncoder];
+
+		[e generateMipmapsForTexture:albedo];
+		[e endEncoding];
+		[b commit];
+	}
+
+	/* the frames */
+	CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+	simd_float4x4 proj = engine_perspective(1.0f, (float)W / H, 0.1f, 60.0f);
+	simd_float3 light = simd_normalize((simd_float3){ -0.4f, -1.0f, -0.3f });
+	simd_float4x4 lightVP = simd_mul(engine_ortho(9.0f, 0.1f, 40.0f),
+	    engine_look_at(-light * 15.0f, (simd_float3){ 0, 0, 0 }, (simd_float3){ 0, 0, 1 }));
+
+	while (frames < 240 && CFAbsoluteTimeGetCurrent() - started < 2.0) {
+		float a = 0.3f + 0.02f * frames;
+		EngineUniforms u = {
+			.viewProj = simd_mul(proj, engine_look_at((simd_float3){ 11 * cosf(a), 7, 11 * sinf(a) }, (simd_float3){ 0, 0.5f, 0 },
+			    (simd_float3){ 0, 1, 0 })),
+			.lightViewProj = lightVP,
+			.lightDir = { light.x, light.y, light.z, 0 },
+			.params = { 1.0f / 60.0f, 0, 0, 0 },
+		};
+		/* (its own buffer, let go of at the end of this iteration: the command buffer keeps it, as Metal's does) */
+		id<MTLBuffer> ub = [g_device newBufferWithBytes:&u length:sizeof(u) options:MTLResourceStorageModeShared];
+		id<MTLCommandBuffer> b = [queue commandBuffer];
+		const uint32_t box = 0, ground = 1;
+
+		{
+			id<MTLComputeCommandEncoder> e = [b computeCommandEncoder];
+
+			[e setComputePipelineState:particles];
+			[e setBuffer:particleBuffer offset:0 atIndex:0];
+			[e setBuffer:args offset:0 atIndex:1];
+			[e setBuffer:ub offset:0 atIndex:2];
+			[e dispatchThreadgroups:MTLSizeMake(PARTICLES / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e endEncoding];
+		}
+		{
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			id<MTLRenderCommandEncoder> e;
+
+			pass.depthAttachment.texture = shadowMap;
+			pass.depthAttachment.loadAction = MTLLoadActionClear;
+			pass.depthAttachment.storeAction = MTLStoreActionStore;
+			pass.depthAttachment.clearDepth = 1.0;
+			e = [b renderCommandEncoderWithDescriptor:pass];
+			[e setRenderPipelineState:shadowPipe];
+			[e setDepthStencilState:depthWrite];
+			[e setVertexBuffer:ub offset:0 atIndex:1];
+			[e setVertexBytes:&box length:4 atIndex:2];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:36 instanceCount:16];
+			[e endEncoding];
+		}
+		{
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			id<MTLRenderCommandEncoder> e;
+
+			pass.colorAttachments[0].texture = msaaColor;
+			pass.colorAttachments[0].resolveTexture = hdr;
+			pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+			pass.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+			pass.colorAttachments[0].clearColor = MTLClearColorMake(0.05, 0.07, 0.12, 1);
+			pass.depthAttachment.texture = msaaDepth;
+			pass.depthAttachment.loadAction = MTLLoadActionClear;
+			pass.depthAttachment.storeAction = MTLStoreActionDontCare;
+			pass.depthAttachment.clearDepth = 1.0;
+			e = [b renderCommandEncoderWithDescriptor:pass];
+			[e setRenderPipelineState:mainPipe];
+			[e setDepthStencilState:depthWrite];
+			[e setVertexBuffer:ub offset:0 atIndex:1];
+			[e setFragmentBuffer:ub offset:0 atIndex:0];
+			[e setFragmentTexture:albedo atIndex:0];
+			[e setFragmentTexture:shadowMap atIndex:1];
+			[e setFragmentSamplerState:trilinear atIndex:0];
+			[e setVertexBytes:&ground length:4 atIndex:2];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:36];
+			[e setVertexBytes:&box length:4 atIndex:2];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:36 instanceCount:16];
+			[e setRenderPipelineState:particlePipe];
+			[e setDepthStencilState:depthRead];
+			[e setVertexBuffer:particleBuffer offset:0 atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle indirectBuffer:args indirectBufferOffset:0];
+			[e endEncoding];
+		}
+		for (int k = 0; k < BLOOM; k++) {
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			id<MTLRenderCommandEncoder> e;
+
+			pass.colorAttachments[0].texture = bloom;
+			pass.colorAttachments[0].level = (NSUInteger)k;
+			pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+			pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+			e = [b renderCommandEncoderWithDescriptor:pass];
+			[e setRenderPipelineState:downPipe];
+			[e setFragmentTexture:k == 0 ? hdr : bloomLevel[k - 1] atIndex:0];
+			[e setFragmentSamplerState:linear atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[e endEncoding];
+		}
+		for (int k = BLOOM - 1; k > 0; k--) {
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			id<MTLRenderCommandEncoder> e;
+
+			pass.colorAttachments[0].texture = bloom;
+			pass.colorAttachments[0].level = (NSUInteger)(k - 1);
+			pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+			pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+			e = [b renderCommandEncoderWithDescriptor:pass];
+			[e setRenderPipelineState:upPipe];
+			[e setFragmentTexture:bloomLevel[k] atIndex:0];
+			[e setFragmentSamplerState:linear atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[e endEncoding];
+		}
+		{
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			id<MTLRenderCommandEncoder> e;
+
+			pass.colorAttachments[0].texture = composite;
+			pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+			pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+			e = [b renderCommandEncoderWithDescriptor:pass];
+			[e setRenderPipelineState:compositePipe];
+			[e setFragmentTexture:hdr atIndex:0];
+			[e setFragmentTexture:bloomLevel[0] atIndex:1];
+			[e setFragmentSamplerState:linear atIndex:0];
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[e endEncoding];
+		}
+		[b addCompletedHandler:^(id<MTLCommandBuffer> done) {
+			if (done.status != MTLCommandBufferStatusCompleted) {
+				@synchronized (inFlight) {
+					if (failed++ == 0) {
+						firstError = [NSString stringWithFormat:@"status %ld: %@", (long)done.status,
+						    done.error.localizedDescription ?: @"no error"];
+					}
+				}
+			}
+		}];
+		[b commit];
+		frames++;
+		[inFlight addObject:b];
+		if (inFlight.count > 2) {
+			[inFlight[0] waitUntilCompleted];
+			[inFlight removeObjectAtIndex:0];
+		}
+	}
+	for (id<MTLCommandBuffer> b in inFlight) {
+		[b waitUntilCompleted];
+	}
+	double seconds = CFAbsoluteTimeGetCurrent() - started;
+
+	/* what came of it */
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	unsigned lit = 0, distinct = 0;
+	unsigned char *px = malloc(W * H * 4);
+	float bloomPeak = 0;
+	uint16_t level3[(W / 16) * (H / 16) * 4];
+	float y = ((float *)particleBuffer.contents)[1];
+
+	if (failed != 0) {
+		[bad addObject:[NSString stringWithFormat:@"%u of %u frames failed (the first: %@)", failed, frames, firstError]];
+	}
+	[composite getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+	for (unsigned i = 0; i < W * H; i++) {
+		unsigned l = (px[i * 4] * 2 + px[i * 4 + 1] * 5 + px[i * 4 + 2]) / 8;
+
+		lit += l > 40;
+		distinct += i > 0 && memcmp(px + i * 4, px + (i - 1) * 4, 3) != 0;
+	}
+	free(px);
+	[bloomLevel[BLOOM - 1] getBytes:level3 bytesPerRow:(W / 16) * 8 fromRegion:MTLRegionMake2D(0, 0, W / 16, H / 16)
+			  mipmapLevel:0];
+	for (unsigned i = 0; i < (W / 16) * (H / 16) * 4; i++) {
+		__fp16 h;
+
+		memcpy(&h, &level3[i], 2);
+		bloomPeak = MAX(bloomPeak, (float)h);
+	}
+	if (fabsf(y - firstY) < 1e-4f) {
+		[bad addObject:[NSString stringWithFormat:@"the particles did not move (y %.3f, as at the start)", y]];
+	}
+	if (lit < W * H / 10) {
+		[bad addObject:[NSString stringWithFormat:@"the picture is dark: %u of %u pixels lit", lit, W * H]];
+	}
+	if (distinct < W * H / 20) {
+		[bad addObject:[NSString stringWithFormat:@"the picture is flat: %u changes along its rows", distinct]];
+	}
+	if (!(bloomPeak > 0.0f)) {
+		[bad addObject:@"the bloom chain's smallest level is empty"];
+	}
+	[t note:@"%u frames in %.2f s (%.0f a second): %u pixels lit, %u changes along the rows, bloom peak %.2f, particle 0 "
+	    "at y %.2f (started %.2f)", frames, seconds, frames / seconds, lit, distinct, bloomPeak, y, firstY];
+	if (bad.count == 0) {
+		[t pass:@"%u engine frames (compute + indirect particles, depth-only shadow, 4x MSAA HDR with shadow compare, bloom "
+		    "through mip levels, sRGB composite), %.0f a second, every one completed", frames, frames / seconds];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /* metal.mtkview's delegate: each frame cleared to a colour of its own and presented, counted */
 @interface MetalViewCounter : NSObject <MTKViewDelegate>
 @property (nonatomic) id<MTLCommandQueue> queue;
@@ -3770,6 +4292,7 @@ static const struct {
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
+	{ "metal.engine", test_metal_engine },
 	{ "metal.mapkit", test_metal_mapkit },
 };
 #define TEST_COUNT      (sizeof(g_tests) / sizeof(g_tests[0]))
