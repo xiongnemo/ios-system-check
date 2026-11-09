@@ -4905,6 +4905,115 @@ test_metal_swizzle(MetalTest *t)
 	}
 }
 
+#pragma mark textures in the vertex stage
+
+static NSString *const kVertexTextureSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct VOut { float4 pos [[position]]; float4 color; };\n"
+"vertex VOut v_vtex_sample(uint vid [[vertex_id]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    VOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.color = t.sample(s, float2(0.5, 0.5), level(0));\n"
+"    return o;\n"
+"}\n"
+"vertex VOut v_vtex_read(uint vid [[vertex_id]], texture2d<float> t [[texture(3)]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    VOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.color = t.read(uint2(0, 0));\n"
+"    return o;\n"
+"}\n"
+"fragment float4 f_vtex(VOut in [[stage_in]]) { return in.color; }\n";
+
+/*
+ * A vertex function that reads a texture -- MapKit's labels with a halo do (GlyphWithNormalHalo), games' terrain and
+ * foliage do -- through sample() with a vertex-stage sampler and through read() at texture index 3; the colour it
+ * reads is what every pixel must be. Until 11-09 the driver dropped every vertex-stage texture and sampler, and such
+ * a draw was refused.
+ */
+static void
+test_metal_vertex_texture(MetalTest *t)
+{
+	static const unsigned char texel[4] = { 40, 160, 220, 255 };
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+	MTLTextureDescriptor *td;
+	id<MTLTexture> source, target;
+	id<MTLRenderPipelineState> sampled, read;
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	id<MTLSamplerState> sampler;
+	NSMutableArray<NSString *> *wrong = [NSMutableArray array];
+	NSString *problem = nil;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kVertexTextureSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	p.fragmentFunction = [lib newFunctionWithName:@"f_vtex"];
+	p.vertexFunction = [lib newFunctionWithName:@"v_vtex_sample"];
+	sampled = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	p.vertexFunction = [lib newFunctionWithName:@"v_vtex_read"];
+	read = [g_device newRenderPipelineStateWithDescriptor:p error:&error];
+	if (sampled == nil || read == nil) {
+		[t fail:@"pipelines refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead;
+	source = [g_device newTextureWithDescriptor:td];
+	[source replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:texel bytesPerRow:4];
+	sd.minFilter = MTLSamplerMinMagFilterNearest;
+	sd.magFilter = MTLSamplerMinMagFilterNearest;
+	sampler = [g_device newSamplerStateWithDescriptor:sd];
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	target = [g_device newTextureWithDescriptor:td];
+	for (unsigned way = 0; way < 2; way++) {
+		MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+		id<MTLCommandBuffer> buffer = [[g_device newCommandQueue] commandBuffer];
+		id<MTLRenderCommandEncoder> e;
+		unsigned char px[4 * 4 * 4];
+		unsigned off = 0;
+
+		d.colorAttachments[0].texture = target;
+		d.colorAttachments[0].loadAction = MTLLoadActionClear;
+		d.colorAttachments[0].storeAction = MTLStoreActionStore;
+		d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+		e = [buffer renderCommandEncoderWithDescriptor:d];
+		[e setRenderPipelineState:way == 0 ? sampled : read];
+		[e setVertexTexture:source atIndex:way == 0 ? 0 : 3];
+		if (way == 0) {
+			[e setVertexSamplerState:sampler atIndex:0];
+		}
+		[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+		[e endEncoding];
+		if (!finish(buffer, &problem)) {
+			[t fail:@"%s: %@", way == 0 ? "sample()" : "read()", problem];
+			return;
+		}
+		[target getBytes:px bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0];
+		for (unsigned i = 0; i < 4 * 4 * 4; i++) {
+			off += abs((int)px[i] - (int)texel[i % 4]) > 1;
+		}
+		if (off != 0) {
+			[wrong addObject:[NSString stringWithFormat:@"%s: pixel 0 %u %u %u %u, wanted %u %u %u %u",
+			    way == 0 ? "sample() with a vertex sampler" : "read() at texture 3", px[0], px[1], px[2], px[3],
+			    texel[0], texel[1], texel[2], texel[3]]];
+		}
+	}
+	if (wrong.count == 0) {
+		[t pass:@"a vertex function's texture, through sample() with a vertex sampler and read(): every pixel its colour"];
+	} else {
+		[t fail:@"%@", [wrong componentsJoinedByString:@"; "]];
+	}
+}
+
 #pragma mark what of Metal's API the device's objects answer
 
 /* a protocol's instance methods, required and optional, with those of the protocols it adopts (not NSObject's) */
@@ -5305,6 +5414,7 @@ static const struct {
 	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
 	{ "metal.swizzle", test_metal_swizzle },
+	{ "metal.vertex.texture", test_metal_vertex_texture },
 	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
