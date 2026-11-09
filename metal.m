@@ -3572,10 +3572,12 @@ engine_look_at(simd_float3 eye, simd_float3 center, simd_float3 up)
 	    { -simd_dot(s, eye), -simd_dot(u, eye), simd_dot(f, eye), 1 } } };
 }
 
+/* the engine's frames for `seconds`: W x H offscreen with every check (layer nil), or into a CAMetalLayer's drawables,
+ * presented, where what counts is that every frame completes and how many there were */
 static void
-test_metal_engine(MetalTest *t)
+engine_run(MetalTest *t, unsigned W, unsigned H, CAMetalLayer *layer, double seconds)
 {
-	enum { W = 256, H = 256, BLOOM = 4, PARTICLES = 1024 };
+	enum { BLOOM = 4, PARTICLES = 1024 };
 	NSError *error = nil;
 	id<MTLLibrary> lib;
 	id<MTLCommandQueue> queue;
@@ -3651,7 +3653,7 @@ test_metal_engine(MetalTest *t)
 	p = [MTLRenderPipelineDescriptor new];
 	p.vertexFunction = [lib newFunctionWithName:@"v_quad"];
 	p.fragmentFunction = [lib newFunctionWithName:@"f_composite"];
-	p.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm_sRGB;
+	p.colorAttachments[0].pixelFormat = layer != nil ? layer.pixelFormat : MTLPixelFormatRGBA8Unorm_sRGB;
 	if ((compositePipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
 		ENGINE_REFUSED(@"the sRGB composite pipeline");
 	}
@@ -3770,7 +3772,20 @@ test_metal_engine(MetalTest *t)
 	simd_float4x4 lightVP = simd_mul(engine_ortho(9.0f, 0.1f, 40.0f),
 	    engine_look_at(-light * 15.0f, (simd_float3){ 0, 0, 0 }, (simd_float3){ 0, 0, 1 }));
 
-	while (frames < 240 && CFAbsoluteTimeGetCurrent() - started < 2.0) {
+	unsigned noDrawable = 0;
+
+	while (frames < (layer != nil ? 100000u : 240u) && CFAbsoluteTimeGetCurrent() - started < seconds) {
+		/* on screen: a drawable a frame, as a game takes one (nextDrawable waits for one to come back) */
+		id<CAMetalDrawable> drawable = nil;
+
+		if (layer != nil) {
+			/* (Core Animation commits on this thread's run loop between frames) */
+			[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate date]];
+			if ((drawable = [layer nextDrawable]) == nil) {
+				noDrawable++;
+				continue;
+			}
+		}
 		float a = 0.3f + 0.02f * frames;
 		EngineUniforms u = {
 			.viewProj = simd_mul(proj, engine_look_at((simd_float3){ 11 * cosf(a), 7, 11 * sinf(a) }, (simd_float3){ 0, 0.5f, 0 },
@@ -3875,7 +3890,7 @@ test_metal_engine(MetalTest *t)
 			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 			id<MTLRenderCommandEncoder> e;
 
-			pass.colorAttachments[0].texture = composite;
+			pass.colorAttachments[0].texture = drawable != nil ? drawable.texture : composite;
 			pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
 			pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 			e = [b renderCommandEncoderWithDescriptor:pass];
@@ -3885,6 +3900,9 @@ test_metal_engine(MetalTest *t)
 			[e setFragmentSamplerState:linear atIndex:0];
 			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 			[e endEncoding];
+		}
+		if (drawable != nil) {
+			[b presentDrawable:drawable];
 		}
 		[b addCompletedHandler:^(id<MTLCommandBuffer> done) {
 			if (done.status != MTLCommandBufferStatusCompleted) {
@@ -3907,14 +3925,26 @@ test_metal_engine(MetalTest *t)
 	for (id<MTLCommandBuffer> b in inFlight) {
 		[b waitUntilCompleted];
 	}
-	double seconds = CFAbsoluteTimeGetCurrent() - started;
+	double took = CFAbsoluteTimeGetCurrent() - started;
+
+	if (layer != nil) {
+		/* on screen: every frame completed, and how many a second */
+		if (failed != 0 || frames == 0) {
+			[t fail:@"%u of %u frames failed (the first: %@); %u times no drawable", failed, frames,
+			    firstError ?: @"none", noDrawable];
+		} else {
+			[t pass:@"%u engine frames at %ux%u on screen in %.1f s: %.1f a second (%u times no drawable), every one "
+			    "completed", frames, W, H, took, frames / took, noDrawable];
+		}
+		return;
+	}
 
 	/* what came of it */
 	NSMutableArray<NSString *> *bad = [NSMutableArray array];
 	unsigned lit = 0, distinct = 0;
 	unsigned char *px = malloc(W * H * 4);
 	float bloomPeak = 0;
-	uint16_t level3[(W / 16) * (H / 16) * 4];
+	uint16_t *level3 = calloc((W / 16) * (H / 16) * 4, sizeof(uint16_t));
 	float y = ((float *)particleBuffer.contents)[1];
 
 	if (failed != 0) {
@@ -3936,6 +3966,7 @@ test_metal_engine(MetalTest *t)
 		memcpy(&h, &level3[i], 2);
 		bloomPeak = MAX(bloomPeak, (float)h);
 	}
+	free(level3);
 	if (fabsf(y - firstY) < 1e-4f) {
 		[bad addObject:[NSString stringWithFormat:@"the particles did not move (y %.3f, as at the start)", y]];
 	}
@@ -3949,13 +3980,50 @@ test_metal_engine(MetalTest *t)
 		[bad addObject:@"the bloom chain's smallest level is empty"];
 	}
 	[t note:@"%u frames in %.2f s (%.0f a second): %u pixels lit, %u changes along the rows, bloom peak %.2f, particle 0 "
-	    "at y %.2f (started %.2f)", frames, seconds, frames / seconds, lit, distinct, bloomPeak, y, firstY];
+	    "at y %.2f (started %.2f)", frames, took, frames / took, lit, distinct, bloomPeak, y, firstY];
 	if (bad.count == 0) {
 		[t pass:@"%u engine frames (compute + indirect particles, depth-only shadow, 4x MSAA HDR with shadow compare, bloom "
-		    "through mip levels, sRGB composite), %.0f a second, every one completed", frames, frames / seconds];
+		    "through mip levels, sRGB composite), %.0f a second, every one completed", frames, frames / took];
 	} else {
 		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
 	}
+}
+
+static void
+test_metal_engine(MetalTest *t)
+{
+	engine_run(t, 256, 256, nil, 2.0);
+}
+
+/*
+ * The same frames as a game draws them: full screen, into a CAMetalLayer's drawables at the screen's own pixel size
+ * (1125 x 2436 here), presented, for three seconds -- the number that says whether such a game would be playable, and
+ * a hunt for whatever the size breaks (4x MSAA RGBA16Float and its depth at that size, a bloom chain half of it).
+ */
+static void
+test_metal_engine_screen(MetalTest *t)
+{
+	UIWindow *window = UIApplication.sharedApplication.keyWindow;
+	CAMetalLayer *layer;
+	CGFloat scale;
+
+	if (g_device == nil || window == nil) {
+		[t skip:@"%@", g_device == nil ? @"no device" : @"no window"];
+		return;
+	}
+	scale = window.screen.nativeScale;
+	layer = [CAMetalLayer layer];
+	layer.device = g_device;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+	layer.framebufferOnly = YES;
+	layer.frame = window.bounds;
+	layer.contentsScale = scale;
+	layer.drawableSize = CGSizeMake(window.bounds.size.width * scale, window.bounds.size.height * scale);
+	[window.layer addSublayer:layer];
+	[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+	engine_run(t, (unsigned)layer.drawableSize.width, (unsigned)layer.drawableSize.height, layer, 3.0);
+	[layer removeFromSuperlayer];
+	[[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
 }
 
 #pragma mark metal.features: what an engine reaches for besides the frame above
@@ -4711,6 +4779,7 @@ static const struct {
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
 	{ "metal.engine", test_metal_engine },
+	{ "metal.engine.screen", test_metal_engine_screen },
 	{ "metal.features", test_metal_features },
 	{ "metal.parallel", test_metal_parallel },
 	{ "metal.mapkit", test_metal_mapkit },
