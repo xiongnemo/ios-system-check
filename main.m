@@ -10,6 +10,7 @@
 #import "check.h"
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach-o/getsect.h>
 #include <signal.h>
 #include <sys/ucontext.h>
 
@@ -71,6 +72,106 @@ crash_where(int signal, void *context)
 
 		crash_name(line, sizeof(line), &n, frame[1]);
 		fp = frame[0] & 0x0000000fffffffffUL;
+	}
+	if (n > (int)sizeof(line) - 2) {
+		n = (int)sizeof(line) - 2;
+	}
+	line[n++] = '\n';
+	(void)write(g_crash_console, line, (size_t)n);
+
+	/*
+	 * And the lazy-binding pointers of the image lr is in, when it has them: how many are zero, and where -- a call
+	 * through one that became zero is how the GL library's crashes of 2026-11-09 ended (pc 0). Every one of them zero
+	 * would be a page lost; a run of them, something writing past its own memory.
+	 */
+	Dl_info info;
+	uintptr_t lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss) & 0x0000000fffffffffUL;
+	unsigned long size = 0;
+	const uint64_t *lazy;
+
+	if (!dladdr((const void *)lr, &info) || info.dli_fbase == NULL ||
+	    (lazy = (const uint64_t *)getsectiondata((const struct mach_header_64 *)info.dli_fbase, "__DATA",
+	    "__la_symbol_ptr", &size)) == NULL || size < 8) {
+		return;
+	}
+	unsigned count = (unsigned)(size / 8), zero = 0, first = ~0u, last = 0, runs = 0, own = 0;
+	uintptr_t low = ~(uintptr_t)0, high = 0;
+	const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+	const struct load_command *lc = (const struct load_command *)(mh + 1);
+	intptr_t slide = 0;
+
+	/* the image's own range (its segments), so that a pointer still at its own __stub_helper -- never bound -- shows */
+	for (uint32_t k = 0; k < mh->ncmds; k++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+
+			if (strcmp(sg->segname, "__TEXT") == 0) {
+				slide = (intptr_t)mh - (intptr_t)sg->vmaddr;
+			}
+			if (sg->vmsize != 0 && strcmp(sg->segname, "__PAGEZERO") != 0) {
+				low = sg->vmaddr < low ? (uintptr_t)sg->vmaddr : low;
+				high = sg->vmaddr + sg->vmsize > high ? (uintptr_t)(sg->vmaddr + sg->vmsize) : high;
+			}
+		}
+	}
+	low += (uintptr_t)slide;
+	high += (uintptr_t)slide;
+	for (unsigned i = 0; i < count; i++) {
+		if (lazy[i] == 0) {
+			runs += i == 0 || lazy[i - 1] != 0;
+			zero++;
+			first = first == ~0u ? i : first;
+			last = i;
+		} else if ((lazy[i] & 0x0000000fffffffffUL) >= low && (lazy[i] & 0x0000000fffffffffUL) < high) {
+			own++;
+		}
+	}
+	n = snprintf(line, sizeof(line), "systemcheck: crash: %s's lazy pointers at +%#lx: %u of %u zero", strrchr(info.dli_fname,
+	    '/') != NULL ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname, (unsigned long)((uintptr_t)lazy -
+	    (uintptr_t)info.dli_fbase), zero, count);
+	if (zero != 0 && n < (int)sizeof(line)) {
+		n += snprintf(line + n, sizeof(line) - (size_t)n, " in %u runs, from entry %u (+%#lx) to %u (+%#lx)", runs, first,
+		    (unsigned long)((uintptr_t)&lazy[first] - (uintptr_t)info.dli_fbase), last,
+		    (unsigned long)((uintptr_t)&lazy[last] - (uintptr_t)info.dli_fbase));
+	}
+	if (n < (int)sizeof(line)) {
+		n += snprintf(line + n, sizeof(line) - (size_t)n, "; %u point into the image itself (its stub helpers: never bound)",
+		    own);
+	}
+
+	/* the GOT, whose dyld_stub_binder entry the stub helpers jump through */
+	unsigned long got_size = 0;
+	const uint64_t *got = (const uint64_t *)getsectiondata(mh, "__DATA_CONST", "__got", &got_size);
+
+	if (got == NULL) {
+		got = (const uint64_t *)getsectiondata(mh, "__DATA", "__got", &got_size);
+	}
+	if (got != NULL && n < (int)sizeof(line)) {
+		unsigned gzero = 0;
+
+		for (unsigned i = 0; i < got_size / 8; i++) {
+			gzero += got[i] == 0;
+		}
+		n += snprintf(line + n, sizeof(line) - (size_t)n, "; GOT: %u of %lu zero", gzero, got_size / 8);
+	}
+
+	/* and the very pointer the call before lr went through: "bl stub", the stub "nop; ldr x16, =ptr; br x16" */
+	const uint32_t *call = (const uint32_t *)(lr - 4);
+
+	if ((*call & 0xfc000000u) == 0x94000000u && n < (int)sizeof(line)) {
+		int32_t imm = (int32_t)(*call << 6) >> 6;
+		const uint32_t *stub = call + imm;
+		const uint32_t *ldr = (stub[0] & 0xff00001fu) == 0x58000010u ? stub : stub + 1;
+
+		if ((uintptr_t)stub >= low && (uintptr_t)stub < high && (*ldr & 0xff00001fu) == 0x58000010u) {
+			int32_t lit = (int32_t)((*ldr >> 5) & 0x7ffff) << 13 >> 13;
+			const uint64_t *ptr = (const uint64_t *)((uintptr_t)ldr + (intptr_t)lit * 4);
+			uint64_t value = *ptr & 0x0000000fffffffffUL;
+
+			n += snprintf(line + n, sizeof(line) - (size_t)n, "; the call's pointer +%#lx = %#llx (%s)",
+			    (unsigned long)((uintptr_t)ptr - (uintptr_t)mh), (unsigned long long)value,
+			    value == 0 ? "zero" : value >= low && value < high ? "into the image: its stub helper" : "bound");
+		}
 	}
 	if (n > (int)sizeof(line) - 2) {
 		n = (int)sizeof(line) - 2;
