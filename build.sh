@@ -47,7 +47,9 @@ cp "$HERE/test.mp4" "$APP/"
 # Xcode's compiler, for iOS 16): its release's alioth-tests.metallib, fetched once into build/ (METALLIB=FILE: that one)
 METALLIB=${METALLIB:-$OUT/alioth-tests-v3.metallib}
 if [ ! -f "$METALLIB" ]; then
-	curl -fsSL -o "$METALLIB" https://github.com/xiongnemo/ios-alioth-devtools/releases/download/v3/alioth-tests.metallib
+	# (retried for two minutes: GitHub's release downloads answered 504 for a while on 2026-11-09)
+	curl -fsSL --retry 6 --retry-delay 20 --retry-all-errors -o "$METALLIB" \
+		https://github.com/xiongnemo/ios-alioth-devtools/releases/download/v3/alioth-tests.metallib
 fi
 cp "$METALLIB" "$APP/alioth-tests.metallib"
 python3 -I "$HERE/mkicon.py" "$APP"
