@@ -4031,6 +4031,17 @@ crash_signal(int signal)
 		put(line, &n, sizeof(line), "\n");
 		if (g_log >= 0) {
 			(void)write(g_log, line, n);
+			/* (where, by image: main.m's line, which the console alone loses when its buffer wraps) */
+			if (check_crash_where[0] != '\0') {
+				char where[1200];
+				size_t m = 0;
+
+				put(where, &m, sizeof(where), "note\t");
+				put(where, &m, sizeof(where), tests[i].ident);
+				put(where, &m, sizeof(where), "\twhere: ");
+				put(where, &m, sizeof(where), check_crash_where);
+				(void)write(g_log, where, m);
+			}
 			(void)fsync(g_log);
 		}
 		n = 0;

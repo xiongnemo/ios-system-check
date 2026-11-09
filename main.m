@@ -22,6 +22,7 @@ static void (*g_on_signal[HOOKS])(int);
 static void (*g_on_exception[HOOKS])(NSException *);
 static int g_hooks;
 static int g_crash_console = -1;
+char check_crash_where[1024];
 
 /* " image+0xoffset" (or " 0xaddress" where no image holds it) appended to line at *n */
 static void
@@ -78,6 +79,14 @@ crash_where(int signal, void *context)
 	}
 	line[n++] = '\n';
 	(void)write(g_crash_console, line, (size_t)n);
+	/* (and for the tabs' logs, without the console's prefix: check_crash_where) */
+	{
+		size_t at = strlen("systemcheck: crash: "), len = (size_t)n - at;
+
+		len = len < sizeof(check_crash_where) - 1 ? len : sizeof(check_crash_where) - 1;
+		memcpy(check_crash_where, line + at, len);
+		check_crash_where[len] = '\0';
+	}
 
 	/*
 	 * And the lazy-binding pointers of the image lr is in, when it has them: how many are zero, and where -- a call

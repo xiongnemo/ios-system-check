@@ -25,6 +25,11 @@ extern BOOL check_gl_spritekit_used, check_gl_scenekit_used;
  */
 void check_watch_crashes(void (*on_signal)(int signal), void (*on_exception)(NSException *exception));
 
+/* the fatal signal's "signal N at pc image+0x..., lr ..., frames ..." (newline-terminated), set before the on_signal
+   hooks run, so that a tab's log says where as well as which test: the console line alone is lost when the kernel's
+   message buffer wraps in a long run (2026-11-09) */
+extern char check_crash_where[1024];
+
 /* where an exception was thrown, for a log line: "slide 0x...: 0x... 0x..." -- the shared cache's slide and the
    return addresses, which the port's tools turn into names (work/wsl/dsc-a2s.sh SLIDE ADDR...) */
 NSString *check_backtrace(NSException *exception);

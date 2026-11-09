@@ -2118,6 +2118,83 @@ test_metal_heap(MetalTest *t)
 	}
 }
 
+/*
+ * Indirect dispatch: k_iota (d[i] = 3i + 1) in groups of 64 with the grid in a buffer (on the K40 port until 11-09 it was
+ * dropped). A grid of 2 the processor wrote at offset 16 of one buffer, and a grid of 3 copied into another by a blit
+ * earlier in the same command buffer -- read at -commit only after the GPU's copy -- must write exactly 128 and 192
+ * values; the rest keeps its 0xffffffff.
+ */
+static void
+test_metal_indirect_dispatch(MetalTest *t)
+{
+	id<MTLFunction> function;
+	id<MTLComputePipelineState> pipeline;
+	id<MTLBuffer> out1, out2, args1, args2, source;
+	id<MTLCommandBuffer> buffer;
+	id<MTLBlitCommandEncoder> blit;
+	id<MTLComputeCommandEncoder> compute;
+	NSString *problem = nil;
+	NSError *error = nil;
+	unsigned wrong1 = 0, wrong2 = 0;
+	uint32_t *a;
+	const uint32_t *v1, *v2;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if ((function = [g_ours newFunctionWithName:@"k_iota"]) == nil ||
+	    (pipeline = [g_device newComputePipelineStateWithFunction:function error:&error]) == nil) {
+		[t fail:@"no k_iota pipeline: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	out1 = [g_device newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
+	out2 = [g_device newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
+	args1 = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	args2 = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	source = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	memset(out1.contents, 0xff, 256 * 4);
+	memset(out2.contents, 0xff, 256 * 4);
+	memset(args2.contents, 0, 64);
+	a = args1.contents;
+	a[4] = 2;
+	a[5] = 1;
+	a[6] = 1;
+	a = source.contents;
+	a[0] = 3;
+	a[1] = 1;
+	a[2] = 1;
+
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	blit = [buffer blitCommandEncoder];
+	[blit copyFromBuffer:source sourceOffset:0 toBuffer:args2 destinationOffset:0 size:12];
+	[blit endEncoding];
+	compute = [buffer computeCommandEncoder];
+	[compute setComputePipelineState:pipeline];
+	[compute setBuffer:out1 offset:0 atIndex:0];
+	[compute dispatchThreadgroupsWithIndirectBuffer:args1 indirectBufferOffset:16
+				  threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[compute setBuffer:out2 offset:0 atIndex:0];
+	[compute dispatchThreadgroupsWithIndirectBuffer:args2 indirectBufferOffset:0
+				  threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[compute endEncoding];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	v1 = out1.contents;
+	v2 = out2.contents;
+	for (unsigned i = 0; i < 256; i++) {
+		wrong1 += v1[i] != (i < 128 ? 3 * i + 1 : 0xffffffffu);
+		wrong2 += v2[i] != (i < 192 ? 3 * i + 1 : 0xffffffffu);
+	}
+	if (wrong1 == 0 && wrong2 == 0) {
+		[t pass:@"a grid of 2 groups from the processor and one of 3 a blit had just written: 128 and 192 values, no more"];
+	} else {
+		[t fail:@"%u and %u of 256 wrong (d1[0] %#x, d1[128] %#x; d2[0] %#x, d2[191] %#x, d2[192] %#x)", wrong1, wrong2, v1[0],
+		    v1[128], v2[0], v2[191], v2[192]];
+	}
+}
+
 /* depth: a near red triangle first, then a far blue one over the whole target -- red stays where both are */
 static void
 test_metal_depth(MetalTest *t)
@@ -3673,6 +3750,7 @@ static const struct {
 	{ "metal.blendcolor", test_metal_blendcolor },
 	{ "metal.indirect", test_metal_indirect },
 	{ "metal.heap", test_metal_heap },
+	{ "metal.indirect.dispatch", test_metal_indirect_dispatch },
 	{ "metal.depth", test_metal_depth },
 	{ "metal.msaa", test_metal_msaa },
 	{ "metal.iota", test_metal_iota },
@@ -3718,6 +3796,15 @@ crashed(int signal_number)
 		n = snprintf(line, sizeof(line), "crashed\t%s\t%s\n", ident, name);
 		if (g_log >= 0 && n > 0) {
 			(void)write(g_log, line, (size_t)n);
+			/* (where, by image: main.m's line, which the console alone loses when its buffer wraps) */
+			if (check_crash_where[0] != '\0') {
+				char where[1200];
+				int m = snprintf(where, sizeof(where), "note\t%s\twhere: %s", ident, check_crash_where);
+
+				if (m > 0) {
+					(void)write(g_log, where, (size_t)(m < (int)sizeof(where) ? m : (int)sizeof(where) - 1));
+				}
+			}
 			(void)fsync(g_log);
 		}
 		n = snprintf(line, sizeof(line), "metalcheck: %s CRASHED %s (the next launch marks it and goes on)\n", ident,
