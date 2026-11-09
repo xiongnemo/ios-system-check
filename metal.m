@@ -2633,6 +2633,80 @@ test_metal_blit(MetalTest *t)
 }
 
 /*
+ * copies in one command buffer, each of which has to see the one before: a pattern buffer to buffer at an offset, from
+ * there into a texture, the middle 8x8 of that texture into a second one, and that read back into a buffer
+ */
+static void
+test_metal_blit_copy(MetalTest *t)
+{
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16
+	    height:16 mipmapped:NO];
+	id<MTLBuffer> src, mid, out;
+	id<MTLTexture> first, second;
+	id<MTLCommandBuffer> buffer;
+	id<MTLBlitCommandEncoder> blit;
+	NSString *problem = nil;
+	unsigned char *p;
+	const unsigned char *o;
+	unsigned wrong = 0, at = 0;
+	unsigned char wanted_at = 0;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	src = [g_device newBufferWithLength:16 * 16 * 4 options:MTLResourceStorageModeShared];
+	mid = [g_device newBufferWithLength:16 * 16 * 4 + 256 options:MTLResourceStorageModeShared];
+	out = [g_device newBufferWithLength:8 * 8 * 4 options:MTLResourceStorageModeShared];
+	p = src.contents;
+	for (unsigned i = 0; i < 16 * 16 * 4; i++) {
+		p[i] = (unsigned char)(i * 7 + 3);
+	}
+	memset(mid.contents, 0, mid.length);
+	memset(out.contents, 0xee, out.length);
+	first = [g_device newTextureWithDescriptor:d];
+	second = [g_device newTextureWithDescriptor:d];
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	if ((blit = [buffer blitCommandEncoder]) == nil) {
+		[t fail:@"blitCommandEncoder returned nil"];
+		return;
+	}
+	[blit copyFromBuffer:src sourceOffset:0 toBuffer:mid destinationOffset:256 size:16 * 16 * 4];
+	[blit copyFromBuffer:mid sourceOffset:256 sourceBytesPerRow:64 sourceBytesPerImage:64 * 16
+	    sourceSize:MTLSizeMake(16, 16, 1) toTexture:first destinationSlice:0 destinationLevel:0
+	    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit copyFromTexture:first sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(4, 4, 0)
+	    sourceSize:MTLSizeMake(8, 8, 1) toTexture:second destinationSlice:0 destinationLevel:0
+	    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit copyFromTexture:second sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+	    sourceSize:MTLSizeMake(8, 8, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:32
+	    destinationBytesPerImage:32 * 8];
+	[blit endEncoding];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+	o = out.contents;
+	for (unsigned y = 0; y < 8; y++) {
+		for (unsigned x = 0; x < 8; x++) {
+			for (unsigned c = 0; c < 4; c++) {
+				unsigned i = ((y + 4) * 16 + (x + 4)) * 4 + c;
+
+				if (o[(y * 8 + x) * 4 + c] != (unsigned char)(i * 7 + 3) && wrong++ == 0) {
+					at = (y * 8 + x) * 4 + c;
+					wanted_at = (unsigned char)(i * 7 + 3);
+				}
+			}
+		}
+	}
+	if (wrong == 0) {
+		[t pass:@"buffer to buffer, to a texture, its middle to a second texture, back to a buffer: all 256 bytes"];
+	} else {
+		[t fail:@"%u of 256 bytes wrong; byte %u is %#x (%#x wanted)", wrong, at, o[at], wanted_at];
+	}
+}
+
+/*
  * SpriteKit on this device: SKRenderer, given it, draws a magenta square in the middle of a black 64x64 target, read
  * back. (Not an SKView: that takes MTLCreateSystemDefaultDevice()'s device, which is nil until the system itself finds
  * this driver, and then draws with OpenGL ES -- the GPU tab's spritekit.* tests.)
@@ -3030,6 +3104,7 @@ static const struct {
 	{ "metal.reduce", test_metal_reduce },
 	{ "metal.constants", test_metal_constants },
 	{ "metal.blit", test_metal_blit },
+	{ "metal.blit.copy", test_metal_blit_copy },
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
