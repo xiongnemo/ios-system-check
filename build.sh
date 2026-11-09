@@ -31,7 +31,7 @@ mkdir -p "$APP"
 $CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
 	-framework UIKit -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework QuartzCore \
 	-framework OpenGLES -framework GLKit -framework CoreImage -framework AVFoundation -framework CoreMedia \
-	-framework AudioToolbox -framework CoreMotion -framework CoreLocation -framework CoreBluetooth \
+	-framework AudioToolbox -framework CoreMotion -framework CoreLocation -framework CoreBluetooth -framework CoreVideo \
 	-framework CoreHaptics -framework IOKit \
 	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit -weak_framework MapKit \
 	-weak_framework MetalPerformanceShaders \

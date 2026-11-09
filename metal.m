@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>
 #import <SceneKit/SceneKit.h>
 #import <SpriteKit/SpriteKit.h>
@@ -5015,6 +5016,136 @@ test_metal_vertex_texture(MetalTest *t)
 	}
 }
 
+#pragma mark video frames as textures
+
+static NSString *const kPlanesKernel = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void k_planes(texture2d<float, access::read> y [[texture(0)]], texture2d<float, access::read> c [[texture(1)]],\n"
+"                     device float *out [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {\n"
+"    uint i = p.y * 64 + p.x;\n"
+"    out[i * 3] = y.read(p).r;\n"
+"    float2 cc = c.read(p / 2).rg;\n"
+"    out[i * 3 + 1] = cc.x;\n"
+"    out[i * 3 + 2] = cc.y;\n"
+"}\n";
+
+/*
+ * A video frame the way a game's cutscene or a video player hands one to Metal: a 4:2:0 CVPixelBuffer over an IOSurface
+ * (luma, then chroma interleaved at half size), each plane a texture through CVMetalTextureCache -- R8 and RG8 over the
+ * surface's own memory, which our device makes (-newTextureWithDescriptor:iosurface:plane:) -- read by a kernel.
+ */
+static void
+test_metal_cvtexture(MetalTest *t)
+{
+	enum { CVT_W = 64, CVT_H = 32 };
+	NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES };
+	CVPixelBufferRef frame = NULL;
+	CVMetalTextureCacheRef cache = NULL;
+	CVMetalTextureRef yt = NULL, ct = NULL;
+	id<MTLTexture> y, c;
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLComputePipelineState> pipe;
+	id<MTLBuffer> out;
+	id<MTLCommandBuffer> buffer;
+	id<MTLComputeCommandEncoder> e;
+	NSString *problem = nil;
+	unsigned off = 0;
+	float first[3] = { 0 };
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if (CVPixelBufferCreate(NULL, CVT_W, CVT_H, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, (__bridge CFDictionaryRef)attrs,
+	    &frame) != kCVReturnSuccess || frame == NULL) {
+		[t fail:@"no 4:2:0 CVPixelBuffer over an IOSurface"];
+		return;
+	}
+	CVPixelBufferLockBaseAddress(frame, 0);
+	{
+		uint8_t *yp = CVPixelBufferGetBaseAddressOfPlane(frame, 0), *cp = CVPixelBufferGetBaseAddressOfPlane(frame, 1);
+		size_t yr = CVPixelBufferGetBytesPerRowOfPlane(frame, 0), cr = CVPixelBufferGetBytesPerRowOfPlane(frame, 1);
+
+		for (unsigned row = 0; row < CVT_H; row++) {
+			for (unsigned col = 0; col < CVT_W; col++) {
+				yp[row * yr + col] = (uint8_t)(col * 3 + row);
+			}
+		}
+		for (unsigned row = 0; row < CVT_H / 2; row++) {
+			for (unsigned col = 0; col < CVT_W / 2; col++) {
+				cp[row * cr + col * 2] = (uint8_t)(100 + col);
+				cp[row * cr + col * 2 + 1] = (uint8_t)(40 + row * 5);
+			}
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(frame, 0);
+	if (CVMetalTextureCacheCreate(NULL, NULL, g_device, NULL, &cache) != kCVReturnSuccess || cache == NULL) {
+		CVPixelBufferRelease(frame);
+		[t fail:@"CVMetalTextureCacheCreate refused the device"];
+		return;
+	}
+	CVReturn ry = CVMetalTextureCacheCreateTextureFromImage(NULL, cache, frame, NULL, MTLPixelFormatR8Unorm, CVT_W,
+	    CVT_H, 0, &yt);
+	CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(NULL, cache, frame, NULL, MTLPixelFormatRG8Unorm, CVT_W / 2,
+	    CVT_H / 2, 1, &ct);
+	y = yt != NULL ? CVMetalTextureGetTexture(yt) : nil;
+	c = ct != NULL ? CVMetalTextureGetTexture(ct) : nil;
+	if (y == nil || c == nil) {
+		[t fail:@"CVMetalTextureCache gave no texture for the %s plane (CVReturn %d for luma, %d for chroma; the frame "
+		    "%s an IOSurface, %zu planes)", y == nil ? "luma" : "chroma", ry, rc,
+		    CVPixelBufferGetIOSurface(frame) != NULL ? "is over" : "is NOT over", CVPixelBufferGetPlaneCount(frame)];
+		goto done;
+	}
+	lib = [g_device newLibraryWithSource:kPlanesKernel options:nil error:&error];
+	pipe = lib != nil ? [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_planes"] error:&error] :
+	    nil;
+	if (pipe == nil) {
+		[t fail:@"the kernel did not build: %@", error.localizedDescription ?: @"nil, no error"];
+		goto done;
+	}
+	out = [g_device newBufferWithLength:CVT_W * CVT_H * 3 * sizeof(float) options:MTLResourceStorageModeShared];
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	e = [buffer computeCommandEncoder];
+	[e setComputePipelineState:pipe];
+	[e setTexture:y atIndex:0];
+	[e setTexture:c atIndex:1];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e dispatchThreads:MTLSizeMake(CVT_W, CVT_H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+	[e endEncoding];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		goto done;
+	}
+	for (unsigned row = 0; row < CVT_H; row++) {
+		for (unsigned col = 0; col < CVT_W; col++) {
+			const float *v = (const float *)out.contents + (row * CVT_W + col) * 3;
+			float wy = (float)((col * 3 + row) & 255) / 255.0f, wcb = (float)(100 + col / 2) / 255.0f,
+			    wcr = (float)(40 + (row / 2) * 5) / 255.0f;
+
+			off += fabsf(v[0] - wy) > 0.003f || fabsf(v[1] - wcb) > 0.003f || fabsf(v[2] - wcr) > 0.003f;
+		}
+	}
+	memcpy(first, out.contents, sizeof(first));
+	if (off == 0) {
+		[t pass:@"a 4:2:0 frame's two planes through CVMetalTextureCache (R8 %lux%lu, RG8 %lux%lu): every sample right",
+		    (unsigned long)y.width, (unsigned long)y.height, (unsigned long)c.width, (unsigned long)c.height];
+	} else {
+		[t fail:@"%u of %u pixels wrong (the first: Y %.3f Cb %.3f Cr %.3f, want 0.000 0.392 0.157)", off, CVT_W * CVT_H,
+		    first[0], first[1], first[2]];
+	}
+done:
+	if (yt != NULL) {
+		CFRelease(yt);
+	}
+	if (ct != NULL) {
+		CFRelease(ct);
+	}
+	CFRelease(cache);
+	CVPixelBufferRelease(frame);
+}
+
 #pragma mark Metal Performance Shaders
 
 /*
@@ -5362,6 +5493,36 @@ test_metal_api(MetalTest *t)
 		    [g_device respondsToSelector:@selector(areRasterOrderGroupsSupported)] ?
 		    (g_device.rasterOrderGroupsSupported ? @"yes" : @"no") : @"not said"];
 	}
+	/* (the older question, by feature set: Flutter's engine draws only where iOS_GPUFamily2_v3 is answered, and stops the
+	 * application otherwise; older Unity players ask these too) */
+	{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		static const struct { MTLFeatureSet set; const char *name; } sets[] = {
+			{ MTLFeatureSet_iOS_GPUFamily1_v1, "1_v1" }, { MTLFeatureSet_iOS_GPUFamily1_v2, "1_v2" },
+			{ MTLFeatureSet_iOS_GPUFamily1_v3, "1_v3" }, { MTLFeatureSet_iOS_GPUFamily1_v4, "1_v4" },
+			{ MTLFeatureSet_iOS_GPUFamily1_v5, "1_v5" }, { MTLFeatureSet_iOS_GPUFamily2_v1, "2_v1" },
+			{ MTLFeatureSet_iOS_GPUFamily2_v2, "2_v2" }, { MTLFeatureSet_iOS_GPUFamily2_v3, "2_v3" },
+			{ MTLFeatureSet_iOS_GPUFamily2_v4, "2_v4" }, { MTLFeatureSet_iOS_GPUFamily2_v5, "2_v5" },
+			{ MTLFeatureSet_iOS_GPUFamily3_v1, "3_v1" }, { MTLFeatureSet_iOS_GPUFamily3_v4, "3_v4" },
+			{ MTLFeatureSet_iOS_GPUFamily4_v1, "4_v1" }, { MTLFeatureSet_iOS_GPUFamily5_v1, "5_v1" },
+		};
+		NSMutableArray<NSString *> *yes = [NSMutableArray array];
+
+		for (unsigned i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
+			if ([g_device supportsFeatureSet:sets[i].set]) {
+				[yes addObject:@(sets[i].name)];
+			}
+		}
+#pragma clang diagnostic pop
+		/* (and the screen's gamut, which with Apple2 decides an engine's drawable format: Flutter's is BGRA10_XR, an
+		 * extended-range format, wherever the screen is not sRGB) */
+		UIDisplayGamut gamut = UIScreen.mainScreen.traitCollection.displayGamut;
+
+		[t note:@"feature sets answered: %@; the screen's gamut: %s", yes.count ? [@"iOS_GPUFamily"
+		    stringByAppendingString:[yes componentsJoinedByString:@" "]] : @"none", gamut == UIDisplayGamutSRGB ? "sRGB" :
+		    gamut == UIDisplayGamutP3 ? "P3" : "unspecified"];
+	}
 	api_census(t, g_device, @protocol(MTLDevice), counts);
 	queue = [g_device newCommandQueue];
 	api_census(t, queue, @protocol(MTLCommandQueue), counts);
@@ -5529,6 +5690,7 @@ static const struct {
 	{ "metal.swizzle", test_metal_swizzle },
 	{ "metal.vertex.texture", test_metal_vertex_texture },
 	{ "metal.mps", test_metal_mps },
+	{ "metal.cvtexture", test_metal_cvtexture },
 	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
