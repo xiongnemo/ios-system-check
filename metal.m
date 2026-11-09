@@ -2942,6 +2942,160 @@ test_metal_view_range(MetalTest *t)
 	}
 }
 
+/* a texture's levels below the first set to zero bytes, every slice: a level nobody makes then reads 0 0 0 0 */
+static void
+zero_levels(id<MTLTexture> texture, NSUInteger bpp, NSUInteger slices)
+{
+	void *zeros = calloc(texture.width * texture.height, bpp);
+
+	for (NSUInteger slice = 0; slice < slices; slice++) {
+		for (NSUInteger level = 1; level < texture.mipmapLevelCount; level++) {
+			NSUInteger w = MAX(texture.width >> level, 1u), h = MAX(texture.height >> level, 1u);
+
+			[texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:slice withBytes:zeros
+				   bytesPerRow:w * bpp bytesPerImage:w * h * bpp];
+		}
+	}
+	free(zeros);
+}
+
+/*
+ * -generateMipmapsForTexture: (on the K40 port until 11-09 the processor's, after waiting for everything, and only slice 0
+ * of an 8-bit format). A 32x32 RGBA8 chain red on its left half and blue on its right: every smaller level the same two
+ * halves, the 1x1 their average; a 16x16 RGBA16Float of 0.5: 0.5 at every level; an 8x8 cube, face 3 green and the rest
+ * black: face 3 green down to 1x1 and face 0 black (with alpha 255: made, not left). Smaller levels zeroed first.
+ */
+static void
+test_metal_mipmaps(MetalTest *t)
+{
+	MTLTextureDescriptor *d8 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32
+	    height:32 mipmapped:YES];
+	MTLTextureDescriptor *d16 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:16
+	    height:16 mipmapped:YES];
+	MTLTextureDescriptor *dc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm size:8
+	    mipmapped:YES];
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	id<MTLTexture> halves, floats, cube;
+	id<MTLCommandBuffer> buffer;
+	id<MTLBlitCommandEncoder> blit;
+	NSString *problem = nil;
+	unsigned char px8[32 * 32 * 4];
+	uint16_t px16[16 * 16 * 4];
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	d8.usage = d16.usage = dc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	halves = [g_device newTextureWithDescriptor:d8];
+	floats = [g_device newTextureWithDescriptor:d16];
+	cube = [g_device newTextureWithDescriptor:dc];
+	if (halves == nil || floats == nil || cube == nil) {
+		[t fail:@"no textures (RGBA8 32x32: %@, RGBA16Float 16x16: %@, cube 8x8: %@)", halves, floats, cube];
+		return;
+	}
+	for (unsigned i = 0; i < 32 * 32; i++) {
+		BOOL left = i % 32 < 16;
+
+		px8[i * 4] = left ? 255 : 0;
+		px8[i * 4 + 1] = 0;
+		px8[i * 4 + 2] = left ? 0 : 255;
+		px8[i * 4 + 3] = 255;
+	}
+	[halves replaceRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0 withBytes:px8 bytesPerRow:32 * 4];
+	zero_levels(halves, 4, 1);
+	for (unsigned i = 0; i < 16 * 16 * 4; i++) {
+		px16[i] = half_of(0.5f);
+	}
+	[floats replaceRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0 withBytes:px16 bytesPerRow:16 * 8];
+	zero_levels(floats, 8, 1);
+	for (NSUInteger face = 0; face < 6; face++) {
+		for (unsigned i = 0; i < 8 * 8; i++) {
+			px8[i * 4] = 0;
+			px8[i * 4 + 1] = face == 3 ? 255 : 0;
+			px8[i * 4 + 2] = 0;
+			px8[i * 4 + 3] = 255;
+		}
+		[cube replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 slice:face withBytes:px8 bytesPerRow:8 * 4
+		      bytesPerImage:8 * 8 * 4];
+	}
+	zero_levels(cube, 4, 6);
+
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	if ((blit = [buffer blitCommandEncoder]) == nil) {
+		[t fail:@"blitCommandEncoder returned nil"];
+		return;
+	}
+	[blit generateMipmapsForTexture:halves];
+	[blit generateMipmapsForTexture:floats];
+	[blit generateMipmapsForTexture:cube];
+	[blit endEncoding];
+	if (!finish(buffer, &problem)) {
+		[t fail:@"%@", problem];
+		return;
+	}
+
+	/* the RGBA8 chain: the halves at 16, 8, 4 and 2 wide, the average at 1x1 */
+	for (NSUInteger level = 1; level < 5; level++) {
+		NSUInteger w = 32 >> level;
+		unsigned wrong = 0;
+		NSString *first = nil;
+
+		[halves getBytes:px8 bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, w) mipmapLevel:level];
+		for (NSUInteger i = 0; i < w * w; i++) {
+			BOOL left = i % w < w / 2;
+			const unsigned char *p = px8 + i * 4;
+			const unsigned want[4] = { left ? 255 : 0, 0, left ? 0 : 255, 255 };
+			BOOL off = NO;
+
+			for (unsigned c = 0; c < 4; c++) {
+				off |= abs((int)p[c] - (int)want[c]) > 1;
+			}
+			if (off && wrong++ == 0) {
+				first = [NSString stringWithFormat:@"(%lu,%lu) %u %u %u %u", (unsigned long)(i % w), (unsigned long)(i / w), p[0],
+				    p[1], p[2], p[3]];
+			}
+		}
+		if (wrong != 0) {
+			[bad addObject:[NSString stringWithFormat:@"RGBA8 level %lu: %u of %lu texels wrong, %@", (unsigned long)level, wrong,
+			    (unsigned long)(w * w), first]];
+		}
+	}
+	[halves getBytes:px8 bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:5];
+	if (abs((int)px8[0] - 128) > 2 || px8[1] > 1 || abs((int)px8[2] - 128) > 2 || px8[3] < 254) {
+		[bad addObject:[NSString stringWithFormat:@"RGBA8 level 5 (1x1) %u %u %u %u, wanted the average 128 0 128 255", px8[0],
+		    px8[1], px8[2], px8[3]]];
+	}
+	/* the RGBA16Float chain: 0.5 at every level */
+	for (NSUInteger level = 1; level < 5; level++) {
+		NSUInteger w = 16 >> level;
+		unsigned wrong = 0;
+
+		memset(px16, 0, sizeof(px16));
+		[floats getBytes:px16 bytesPerRow:w * 8 fromRegion:MTLRegionMake2D(0, 0, w, w) mipmapLevel:level];
+		for (NSUInteger i = 0; i < w * w * 4; i++) {
+			wrong += px16[i] != half_of(0.5f);
+		}
+		if (wrong != 0) {
+			[bad addObject:[NSString stringWithFormat:@"RGBA16Float level %lu: %u of %lu halves not 0.5 (the first %04x)",
+			    (unsigned long)level, wrong, (unsigned long)(w * w * 4), px16[0]]];
+		}
+	}
+	/* the cube: face 3 green and face 0 black, made at every level */
+	for (NSUInteger level = 1; level < 4; level++) {
+		expect_texels(bad, [NSString stringWithFormat:@"cube face 3, level %lu", (unsigned long)level], cube, level, 3, 0, 255,
+		    0);
+	}
+	expect_texels(bad, @"cube face 0, level 3", cube, 3, 0, 0, 0, 0);
+
+	if (bad.count == 0) {
+		[t pass:@"an RGBA8 chain (the two halves at every level, their average at 1x1), an RGBA16Float one (0.5 throughout) "
+		    "and every face of a cube (face 3 green, face 0 black, down to 1x1)"];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /*
  * SpriteKit on this device: SKRenderer, given it, draws a magenta square in the middle of a black 64x64 target, read
  * back. (Not an SKView: that takes MTLCreateSystemDefaultDevice()'s device, which is nil until the system itself finds
@@ -3342,6 +3496,7 @@ static const struct {
 	{ "metal.blit", test_metal_blit },
 	{ "metal.blit.copy", test_metal_blit_copy },
 	{ "metal.view.range", test_metal_view_range },
+	{ "metal.mipmaps", test_metal_mipmaps },
 	{ "metal.spritekit", test_metal_spritekit },
 	{ "metal.scenekit", test_metal_scenekit },
 	{ "metal.mtkview", test_metal_mtkview },
