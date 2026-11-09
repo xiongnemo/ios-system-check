@@ -1628,6 +1628,80 @@ test_metal_compressed(MetalTest *t)
 	}
 }
 
+/*
+ * The packed 32-bit formats, one word in every texel of a 4x4 texture, sampled (v_fullscreen + f_texture) into the
+ * BGRA8 target: which channel each field lands in. The layout taken (the K40 port, 11-09): the first-named channel in
+ * the low bits, as Vulkan's formats MoltenVK maps onto these. A field in the wrong place shows as red and blue swapped.
+ *   RGB10A2Unorm  R = 1023, A = 3             0xC00003FF  -> 255   0   0
+ *   BGR10A2Unorm  the same word, B first      0xC00003FF  ->   0   0 255
+ *   RG11B10Float  R = 1.0, G = 0.5, B = 0     0x001C03C0  -> 255 128   0
+ *   RGB9E5Float   R = 1.0, G = 0.5 (exp 16)   0x80010100  -> 255 128   0
+ */
+static NSString *
+packed32_round(MTLPixelFormat format, uint32_t word, unsigned r, unsigned g, unsigned b)
+{
+	static unsigned char px[SIDE * SIDE * 4];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:4 height:4 mipmapped:NO];
+	MTLSamplerDescriptor *s = [MTLSamplerDescriptor new];
+	__block id<MTLTexture> texture;
+	__block id<MTLSamplerState> sampler;
+	uint32_t words[16];
+	NSString *problem = nil;
+	unsigned wrong = 0;
+
+	d.usage = MTLTextureUsageShaderRead;
+	if ((texture = [g_device newTextureWithDescriptor:d]) == nil) {
+		return @"no texture";
+	}
+	for (unsigned i = 0; i < 16; i++) {
+		words[i] = word;
+	}
+	[texture replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:words bytesPerRow:16];
+	s.minFilter = s.magFilter = MTLSamplerMinMagFilterNearest;
+	sampler = [g_device newSamplerStateWithDescriptor:s];
+	if (!render_ours(@"v_fullscreen", @"f_texture", MTLClearColorMake(0, 0, 0, 1), nil, nil,
+	    ^(id<MTLRenderCommandEncoder> e) {
+		    [e setFragmentTexture:texture atIndex:0];
+		    [e setFragmentSamplerState:sampler atIndex:0];
+		    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	    }, px, &problem)) {
+		return problem;
+	}
+	for (unsigned i = 0; i < SIDE * SIDE; i++) {
+		wrong += !px_near(px + i * 4, b, g, r, 255, 1);
+	}
+	return wrong == 0 ? nil : [NSString stringWithFormat:@"%u of %u pixels wrong, %@ (B G R A; wanted R G B %u %u %u)",
+	    wrong, SIDE * SIDE, px_text(px, SIDE / 2, SIDE / 2), r, g, b];
+}
+
+static void
+test_metal_packed32(MetalTest *t)
+{
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	NSString *r;
+
+	if (!ours_ready(t)) {
+		return;
+	}
+	if ((r = packed32_round(MTLPixelFormatRGB10A2Unorm, 0xC00003FFu, 255, 0, 0)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"RGB10A2Unorm: %@", r]];
+	}
+	if ((r = packed32_round(MTLPixelFormatBGR10A2Unorm, 0xC00003FFu, 0, 0, 255)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"BGR10A2Unorm: %@", r]];
+	}
+	if ((r = packed32_round(MTLPixelFormatRG11B10Float, 0x001C03C0u, 255, 128, 0)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"RG11B10Float: %@", r]];
+	}
+	if ((r = packed32_round(MTLPixelFormatRGB9E5Float, 0x80010100u, 255, 128, 0)) != nil) {
+		[bad addObject:[NSString stringWithFormat:@"RGB9E5Float: %@", r]];
+	}
+	if (bad.count == 0) {
+		[t pass:@"RGB10A2Unorm, BGR10A2Unorm, RG11B10Float and RGB9E5Float: every field in its channel"];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 /* v_fullscreen + f_texture: a 4x4 RGBA8 texture, nearest, over the whole target -- 16x16 blocks of its texels */
 static void
 test_metal_texture(MetalTest *t)
@@ -3590,6 +3664,7 @@ static const struct {
 	{ "metal.vbuffer", test_metal_vbuffer },
 	{ "metal.texture", test_metal_texture },
 	{ "metal.compressed", test_metal_compressed },
+	{ "metal.packed32", test_metal_packed32 },
 	{ "metal.blend", test_metal_blend },
 	{ "metal.viewport", test_metal_viewport },
 	{ "metal.scissor", test_metal_scissor },
