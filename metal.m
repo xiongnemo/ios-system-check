@@ -12,6 +12,7 @@
 #import <MapKit/MapKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <QuartzCore/QuartzCore.h>
 #import <SceneKit/SceneKit.h>
 #import <SpriteKit/SpriteKit.h>
@@ -5014,6 +5015,118 @@ test_metal_vertex_texture(MetalTest *t)
 	}
 }
 
+#pragma mark Metal Performance Shaders
+
+/*
+ * MPS on the device -- Core Image's filters, Vision and Core ML go through it -- which says whether it takes a device
+ * by its GPU families (MPSSupportsMTLDevice: Apple2 or later). A Gaussian blur of one bright point in a float texture
+ * (the middle, the symmetry, the sum kept) and a 16 x 16 matrix product against the processor's. MPS's own kernels,
+ * compiled for this device by our compiler.
+ */
+static void
+test_metal_mps(MetalTest *t)
+{
+	enum { MPS_SIDE = 33, MPS_N = 16 };
+	float *plane, sum = 0, mid, left, right, up, down;
+	MTLTextureDescriptor *td;
+	id<MTLTexture> src, dst;
+	id<MTLCommandBuffer> buffer;
+	id<MTLBuffer> a, b, c;
+	NSString *problem = nil;
+	NSMutableArray<NSString *> *wrong = [NSMutableArray array];
+	unsigned off = 0;
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	/* (linked weakly: its classes there means its functions are too) */
+	if (NSClassFromString(@"MPSImageGaussianBlur") == nil) {
+		[t skip:@"no MetalPerformanceShaders"];
+		return;
+	}
+	if (!MPSSupportsMTLDevice(g_device)) {
+		/* (the K40's driver tells MPS no family: MPSImage's kernels are not in the system as AIR, and with Apple2
+		 * told a blur aborted in MPSDevice::GetLibrary -- so this is the answer that keeps applications alive) */
+		[t skip:@"MPSSupportsMTLDevice says NO for this device: applications that ask take their own road"];
+		return;
+	}
+	plane = calloc(MPS_SIDE * MPS_SIDE, sizeof(float));
+	plane[(MPS_SIDE / 2) * MPS_SIDE + MPS_SIDE / 2] = 1.0f;
+	td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:MPS_SIDE height:MPS_SIDE
+	    mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	src = [g_device newTextureWithDescriptor:td];
+	dst = [g_device newTextureWithDescriptor:td];
+	[src replaceRegion:MTLRegionMake2D(0, 0, MPS_SIDE, MPS_SIDE) mipmapLevel:0 withBytes:plane bytesPerRow:MPS_SIDE * 4];
+	a = [g_device newBufferWithLength:MPS_N * MPS_N * 4 options:MTLResourceStorageModeShared];
+	b = [g_device newBufferWithLength:MPS_N * MPS_N * 4 options:MTLResourceStorageModeShared];
+	c = [g_device newBufferWithLength:MPS_N * MPS_N * 4 options:MTLResourceStorageModeShared];
+	for (unsigned i = 0; i < MPS_N * MPS_N; i++) {
+		((float *)a.contents)[i] = (float)(i % 7) - 3.0f;
+		((float *)b.contents)[i] = (float)(i % 5) - 2.0f;
+	}
+	buffer = [[g_device newCommandQueue] commandBuffer];
+	{
+		MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:g_device sigma:2.0f];
+		MPSMatrixDescriptor *md = [MPSMatrixDescriptor matrixDescriptorWithRows:MPS_N columns:MPS_N rowBytes:MPS_N * 4
+		    dataType:MPSDataTypeFloat32];
+		MPSMatrixMultiplication *mul = [[MPSMatrixMultiplication alloc] initWithDevice:g_device transposeLeft:NO
+		    transposeRight:NO resultRows:MPS_N resultColumns:MPS_N interiorColumns:MPS_N alpha:1.0 beta:0.0];
+
+		if (blur == nil || mul == nil) {
+			free(plane);
+			[t fail:@"MPS gave %s nil", blur == nil ? "the Gaussian blur" : "the matrix multiplication"];
+			return;
+		}
+		[blur encodeToCommandBuffer:buffer sourceTexture:src destinationTexture:dst];
+		[mul encodeToCommandBuffer:buffer leftMatrix:[[MPSMatrix alloc] initWithBuffer:a descriptor:md]
+		    rightMatrix:[[MPSMatrix alloc] initWithBuffer:b descriptor:md]
+		    resultMatrix:[[MPSMatrix alloc] initWithBuffer:c descriptor:md]];
+	}
+	if (!finish(buffer, &problem)) {
+		free(plane);
+		[t fail:@"%@", problem];
+		return;
+	}
+	[dst getBytes:plane bytesPerRow:MPS_SIDE * 4 fromRegion:MTLRegionMake2D(0, 0, MPS_SIDE, MPS_SIDE) mipmapLevel:0];
+	for (unsigned i = 0; i < MPS_SIDE * MPS_SIDE; i++) {
+		sum += plane[i];
+	}
+	mid = plane[(MPS_SIDE / 2) * MPS_SIDE + MPS_SIDE / 2];
+	left = plane[(MPS_SIDE / 2) * MPS_SIDE + MPS_SIDE / 2 - 2];
+	right = plane[(MPS_SIDE / 2) * MPS_SIDE + MPS_SIDE / 2 + 2];
+	up = plane[(MPS_SIDE / 2 - 2) * MPS_SIDE + MPS_SIDE / 2];
+	down = plane[(MPS_SIDE / 2 + 2) * MPS_SIDE + MPS_SIDE / 2];
+	/* (sigma 2: the middle 1 / (2 pi 4) = 0.0398, two away 0.0398 e^(-1/2) = 0.0241) */
+	if (fabsf(mid - 0.0398f) > 0.008f || fabsf(left - right) > 0.002f || fabsf(up - down) > 0.002f ||
+	    fabsf(left - up) > 0.002f || fabsf(left - 0.0241f) > 0.006f || fabsf(sum - 1.0f) > 0.05f) {
+		[wrong addObject:[NSString stringWithFormat:@"blur: middle %.4f (want 0.0398), two away %.4f %.4f %.4f %.4f "
+		    "(want 0.0241), sum %.3f (want 1)", mid, left, right, up, down, sum]];
+	}
+	free(plane);
+	for (unsigned r = 0; r < MPS_N; r++) {
+		for (unsigned col = 0; col < MPS_N; col++) {
+			float want = 0;
+
+			for (unsigned k = 0; k < MPS_N; k++) {
+				want += ((float *)a.contents)[r * MPS_N + k] * ((float *)b.contents)[k * MPS_N + col];
+			}
+			off += fabsf(((float *)c.contents)[r * MPS_N + col] - want) > 1e-3f;
+		}
+	}
+	if (off != 0) {
+		[wrong addObject:[NSString stringWithFormat:@"matrix product: %u of %u values wrong (C[0][0] %.2f)", off, MPS_N * MPS_N,
+		    ((float *)c.contents)[0]]];
+	}
+	if (wrong.count == 0) {
+		[t pass:@"MPS takes the device; a Gaussian blur (sigma 2: middle %.4f, sum %.3f) and a 16 x 16 matrix product "
+		    "right", mid, sum];
+	} else {
+		[t fail:@"%@", [wrong componentsJoinedByString:@"; "]];
+	}
+}
+
 #pragma mark what of Metal's API the device's objects answer
 
 /* a protocol's instance methods, required and optional, with those of the protocols it adopts (not NSObject's) */
@@ -5415,6 +5528,7 @@ static const struct {
 	{ "metal.mapkit", test_metal_mapkit },
 	{ "metal.swizzle", test_metal_swizzle },
 	{ "metal.vertex.texture", test_metal_vertex_texture },
+	{ "metal.mps", test_metal_mps },
 	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
