@@ -5186,6 +5186,113 @@ test_metal_msaa_stencil(MetalTest *t)
 	}
 }
 
+static NSString *const kRestartSource = @
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"vertex float4 v_pos(uint i [[vertex_id]], constant float2 *p [[buffer(0)]]) { return float4(p[i], 0.0, 1.0); }\n"
+"fragment half4 f_paint(constant float4 &c [[buffer(0)]]) { return half4(c); }\n";
+
+/*
+ * Primitive restart, which Metal always has for an indexed draw: the index type's largest value (0xFFFF, 0xFFFFFFFF)
+ * ends the strip and starts another. Two quads as one triangle strip with a restart between them: the left and right
+ * quarters drawn, the middle not -- a bridging triangle would cover it, and a driver that takes the restart for a
+ * vertex reads far past the buffer. Flutter's Impeller joins the strips of its paths this way.
+ */
+static void
+test_metal_restart(MetalTest *t)
+{
+	enum { TS = 64 };
+	static const float pos[8][2] = { { -1, -1 }, { -1, 1 }, { -0.5f, -1 }, { -0.5f, 1 }, { 0.5f, -1 }, { 0.5f, 1 }, { 1, -1 },
+		{ 1, 1 } };
+	static const uint16_t i16[9] = { 0, 1, 2, 3, 0xffff, 4, 5, 6, 7 };
+	static const uint32_t i32[9] = { 0, 1, 2, 3, 0xffffffffu, 4, 5, 6, 7 };
+	NSMutableArray<NSString *> *bad = [NSMutableArray array];
+	NSError *error = nil;
+	id<MTLLibrary> lib;
+	id<MTLRenderPipelineState> pipe;
+	id<MTLCommandQueue> queue;
+	MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
+
+	if (g_device == nil) {
+		[t skip:@"no device"];
+		return;
+	}
+	if ((lib = [g_device newLibraryWithSource:kRestartSource options:nil error:&error]) == nil) {
+		[t fail:@"the shaders did not compile: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	p.vertexFunction = [lib newFunctionWithName:@"v_pos"];
+	p.fragmentFunction = [lib newFunctionWithName:@"f_paint"];
+	p.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	if ((pipe = [g_device newRenderPipelineStateWithDescriptor:p error:&error]) == nil) {
+		[t fail:@"the pipeline was refused: %@", error.localizedDescription ?: @"nil, no error"];
+		return;
+	}
+	queue = [g_device newCommandQueue];
+	for (unsigned k = 0; k < 2; k++) {
+		BOOL wide = k == 1;
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:TS
+		    height:TS mipmapped:NO];
+		MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+		id<MTLTexture> target;
+		id<MTLBuffer> vb = [g_device newBufferWithBytes:pos length:sizeof(pos) options:MTLResourceStorageModeShared];
+		id<MTLBuffer> ib = wide ? [g_device newBufferWithBytes:i32 length:sizeof(i32) options:MTLResourceStorageModeShared] :
+		    [g_device newBufferWithBytes:i16 length:sizeof(i16) options:MTLResourceStorageModeShared];
+		id<MTLCommandBuffer> b;
+		id<MTLRenderCommandEncoder> e;
+		const float green[4] = { 0, 1, 0, 1 };
+		NSString *problem = nil;
+		unsigned char px[TS * TS * 4];
+		unsigned wrong = 0;
+		int first = -1;
+
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		target = [g_device newTextureWithDescriptor:td];
+		d.colorAttachments[0].texture = target;
+		d.colorAttachments[0].loadAction = MTLLoadActionClear;
+		d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+		d.colorAttachments[0].storeAction = MTLStoreActionStore;
+		b = [queue commandBuffer];
+		e = [b renderCommandEncoderWithDescriptor:d];
+		[e setRenderPipelineState:pipe];
+		[e setVertexBuffer:vb offset:0 atIndex:0];
+		[e setFragmentBytes:green length:sizeof(green) atIndex:0];
+		[e drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:9
+			       indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0];
+		[e endEncoding];
+		if (!finish(b, &problem)) {
+			[bad addObject:[NSString stringWithFormat:@"%s indices: %@", wide ? "32-bit" : "16-bit", problem]];
+			continue;
+		}
+		[target getBytes:px bytesPerRow:TS * 4 fromRegion:MTLRegionMake2D(0, 0, TS, TS) mipmapLevel:0];
+		for (unsigned y = 1; y < TS - 1; y++) {
+			for (unsigned x = 1; x < TS - 1; x++) {
+				const unsigned char *q = px + (y * TS + x) * 4;
+				BOOL on = x < TS / 4 - 1 || x > TS * 3 / 4, off = x > TS / 4 + 1 && x < TS * 3 / 4 - 1;
+
+				if ((on && !px_near(q, 0, 255, 0, 255, 2)) || (off && !px_near(q, 0, 0, 0, 255, 2))) {
+					wrong++;
+					if (first < 0) {
+						first = (int)(y * TS + x);
+					}
+				}
+			}
+		}
+		if (wrong != 0) {
+			const unsigned char *q = px + first * 4;
+
+			[bad addObject:[NSString stringWithFormat:@"%s indices: %u pixels wrong, the first (%d,%d) BGRA %u %u %u %u (green "
+			    "quarters left and right, black between)", wide ? "32-bit" : "16-bit", wrong, first % TS, first / TS, q[0], q[1],
+			    q[2], q[3]]];
+		}
+	}
+	if (bad.count == 0) {
+		[t pass:@"a triangle strip restarted at 0xFFFF and at 0xFFFFFFFF: two quads, nothing between them"];
+	} else {
+		[t fail:@"%@", [bad componentsJoinedByString:@"; "]];
+	}
+}
+
 #pragma mark video frames as textures
 
 static NSString *const kPlanesKernel = @
@@ -5862,6 +5969,7 @@ static const struct {
 	{ "metal.mps", test_metal_mps },
 	{ "metal.cvtexture", test_metal_cvtexture },
 	{ "metal.msaa.stencil", test_metal_msaa_stencil },
+	{ "metal.restart", test_metal_restart },
 	{ "metal.status", test_metal_status },
 	{ "metal.api", test_metal_api },
 };
