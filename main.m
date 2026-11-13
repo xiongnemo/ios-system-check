@@ -272,10 +272,12 @@ static const struct tab {
 } tabs[] = {
 	{ @"gpu", @"GPU", @"cpu", gpu_controller, YES, gpu_run },
 	{ @"metal", @"Metal", @"cube", metal_controller, YES, metal_run },
-	{ @"video", @"Video", @"play.rectangle", video_controller, NO, video_run },
+	/* (an iPhone's tab bar shows five: the sixth and on go under More -- the GPS tab among the five, Video and Motion
+	 * under More; the URLs go by name, so the order is the bar's only) */
 	{ @"sensors", @"Sensors", @"gauge", sensor_controller, YES, NULL },
-	{ @"motion", @"Motion", @"gyroscope", motion_controller, NO, NULL },
 	{ @"gps", @"GPS", @"location.circle", gps_controller, NO, gps_run },
+	{ @"motion", @"Motion", @"gyroscope", motion_controller, NO, NULL },
+	{ @"video", @"Video", @"play.rectangle", video_controller, NO, video_run },
 };
 #define TAB_COUNT ((NSUInteger)(sizeof(tabs) / sizeof(tabs[0])))
 
