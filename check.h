@@ -8,11 +8,13 @@ UIViewController *metal_controller(void);       /* metal.m: Metal Check */
 UIViewController *video_controller(void);       /* video.m: a video through AVPlayer */
 UIViewController *sensor_controller(void);      /* sensors.m: Sensor Check */
 UIViewController *motion_controller(void);      /* motion.m: Motion Test */
+UIViewController *gps_controller(void);         /* gps.m: the satellites, the fix (after the GPS Status app) */
 
 /* systemcheck://<tab>/run: the tab's tests, as its Run button would start them (the tab is in front by then) */
 void gpu_run(void);
 void metal_run(void);
 void video_run(void);
+void gps_run(void);                             /* a DEMO sky: made-up satellites, to check the drawing */
 
 /* Whether the GPU tab has made an SKView / SCNView in this process (gpu.m sets them). SpriteKit and SceneKit pick
    OpenGL ES or Metal once a process, so the Metal tab's spritekit and scenekit tests mean something only before. */

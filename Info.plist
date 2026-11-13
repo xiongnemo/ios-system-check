@@ -27,9 +27,9 @@
 		</dict>
 	</dict>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>iPhoneOS</string>
@@ -72,7 +72,7 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>System Check shows the microphone's level. Nothing is kept: the recording is deleted as it goes.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>System Check shows the location and the compass's true heading while its Sensors tab is open.</string>
+	<string>System Check shows the location and the compass's true heading while its Sensors or GPS tab is open.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>System Check shows whether Bluetooth is there and on. It connects to nothing.</string>
 	<key>NSMotionUsageDescription</key>

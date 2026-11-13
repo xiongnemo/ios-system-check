@@ -36,7 +36,7 @@ $CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
 	-weak_framework Metal -weak_framework MetalKit -weak_framework SpriteKit -weak_framework SceneKit \
 	-weak_framework MetalPerformanceShaders \
 	-o "$APP/SystemCheck" "$HERE/main.m" "$HERE/gpu.m" "$HERE/metal.m" "$HERE/video.m" "$HERE/sensors.m" \
-	"$HERE/motion.m"
+	"$HERE/motion.m" "$HERE/gps.m"
 if command -v "$LDID" >/dev/null 2>&1; then
 	sed 's/\r$//' "$HERE/Entitlements.plist" > "$OUT/Entitlements.plist"
 	"$LDID" -S"$OUT/Entitlements.plist" "$APP/SystemCheck"

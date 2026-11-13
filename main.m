@@ -3,7 +3,8 @@
 // application finds of Metal), Video (a clip played through AVPlayer), Sensors (Sensor Check: every sensor and input,
 // live) and Motion (Motion Test: a phone in 3D that turns as this one does). On an iPhone it is an ordinary
 // application. Nothing runs by itself: a tab's Run button, or a URL from the computer --
-//     systemcheck://<gpu|metal|video|sensors|motion>[/run]
+//     systemcheck://<gpu|metal|video|sensors|motion|gps>[/run]
+// (GPS, after the GPS Status app: the satellites -- from the modem, on the K40 port -- and the fix; its /run: a DEMO sky)
 // (the tab brought to the front, and its tests started). The tests' logs, Documents/gpucheck.log and metalcheck.log,
 // and their lines on /dev/console ("gpucheck: ...", "metalcheck: ...", "videocheck: ...") are what they were in the
 // separate applications. build.sh builds it into SystemCheck.ipa (mkicon.py its icon).
@@ -274,6 +275,7 @@ static const struct tab {
 	{ @"video", @"Video", @"play.rectangle", video_controller, NO, video_run },
 	{ @"sensors", @"Sensors", @"gauge", sensor_controller, YES, NULL },
 	{ @"motion", @"Motion", @"gyroscope", motion_controller, NO, NULL },
+	{ @"gps", @"GPS", @"location.circle", gps_controller, NO, gps_run },
 };
 #define TAB_COUNT ((NSUInteger)(sizeof(tabs) / sizeof(tabs[0])))
 

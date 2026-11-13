@@ -1,6 +1,6 @@
 # System Check
 
-把为 Redmi K40（alioth）上的 iOS 16.5 移植写的几个检测应用合成一个：一个 App，下面五个标签页。
+把为 Redmi K40（alioth）上的 iOS 16.5 移植写的几个检测应用合成一个：一个 App，下面六个标签页。
 普通 iPhone 上它就是一个普通应用。
 
 | 标签 | 原来的应用 | 做什么 |
@@ -10,11 +10,12 @@
 | Video | VideoCheck | 用 AVPlayer + AVPlayerLayer 循环播放内置的 6 秒测试视频（ffmpeg 的 testsrc2），报告播放器状态 |
 | Sensors | Sensor Check | 每个传感器和硬件输入实时显示：光线、距离、加速度计、陀螺仪、磁力计、气压、计步、指南针、定位、电池、麦克风、摄像头、蓝牙、方向、音量键、屏幕帧率、触摸、振动 |
 | Motion | Motion Test | 一部 3D 的手机跟着这台手机转（CoreMotion 的姿态），下面是加速度计、陀螺仪、设备运动的数值 |
+| GPS | （新） | 仿 GPS Status：卫星天空图（方位、仰角，按信号强度上色，参与定位的实心，随指南针转）、每颗卫星的信号柱、定位状态（在视/跟踪/使用的卫星数、精度、坐标、高度、速度、航向、定位时间）。数据两路并列：iOS 自己的（CoreLocation），以及移植内核从基带读到的卫星（sysctl `kern.hakios.gnss`，K40 的 SDX55 走 QMI LOC；iOS 不给应用卫星信息，所以卫星只来自这里，别的设备上没有这一路）。`/run` 画一张标着 DEMO 的假天空，用来检查绘制 |
 
 - 打开时不会自己跑：GPU、Metal、Video 各有 Run 按钮。同一次启动里第一次按 Run 时，如果上次启动跑到一半崩了，
   就从崩掉的那一项后面接着跑，之前崩过的项照样跳过；之后再按就是 Run again：从头跑，忘掉之前的标记。
-- Sensors、Motion 只在自己的标签页在前台时才开传感器，切走就关（距离传感器开着会让屏幕在靠近时熄灭）。
-- 从电脑上驱动（移植的测试工具就是这么用的）：`systemcheck://<gpu|metal|video|sensors|motion>[/run]`，
+- Sensors、Motion、GPS 只在自己的标签页在前台时才开传感器和定位，切走就关（距离传感器开着会让屏幕在靠近时熄灭）。
+- 从电脑上驱动（移植的测试工具就是这么用的）：`systemcheck://<gpu|metal|video|sensors|motion|gps>[/run]`，
   切到那个标签页，带 `/run` 就开始测。
 - 记录和原来一样：`Documents/gpucheck.log`、`Documents/metalcheck.log`（开了文件共享），
   `/dev/console` 和 NSLog 里的 `gpucheck: …`、`metalcheck: …`、`videocheck: …`。
