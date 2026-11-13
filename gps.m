@@ -11,7 +11,9 @@
 // console line ("gpscheck: ...") has the counts and the accuracy, never the coordinates.
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
+#include <fcntl.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 #import "check.h"
 
 /* the kernel's struct alioth_gnss, version 1 (bsd/dev/alioth_mdm.c of the port): IEEE bits for its numbers */
@@ -101,6 +103,28 @@ snr_color(float snr)
 		return [UIColor colorWithRed:0.90 green:0.80 blue:0.15 alpha:1];
 	}
 	return [UIColor colorWithRed:0.25 green:0.75 blue:0.30 alpha:1];
+}
+
+/* a line appended to Documents/gpscheck.log (counts and accuracy only: the callers never pass a position) */
+static void
+gps_log(NSString *line)
+{
+	NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?:
+	    NSTemporaryDirectory();
+	NSString *path = [documents stringByAppendingPathComponent:@"gpscheck.log"];
+	NSDateFormatter *f = [NSDateFormatter new];
+	NSData *bytes;
+	int fd;
+
+	f.dateFormat = @"HH:mm:ss";
+	bytes = [[NSString stringWithFormat:@"%@ %@\n", [f stringFromDate:[NSDate date]], line]
+	    dataUsingEncoding:NSUTF8StringEncoding];
+	[NSFileManager.defaultManager createDirectoryAtPath:documents withIntermediateDirectories:YES attributes:nil error:nil];
+	fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (fd >= 0) {
+		(void)write(fd, bytes.bytes, bytes.length);
+		close(fd);
+	}
 }
 
 /* one satellite as the views draw it */
@@ -515,14 +539,29 @@ session_name(uint32_t s)
 	[t appendFormat:@"  compass %@\n", isnan(self.heading) ? @"-" : [NSString stringWithFormat:@"%.0f°", self.heading]];
 	self.label.text = t;
 
-	/* a console line every 5 s for the computer's tests: counts and accuracy, never the position */
+	/*
+	 * a line every 5 s for the computer's tests: counts and accuracy, never the position -- to the console and to
+	 * Documents/gpscheck.log (the console lines of applications are not in the kernel's log the tests read). "simulated"
+	 * is iOS's own mark on a location given through CoreLocation's simulation: the port's gnss_feed hands locationd the
+	 * modem's fixes that way, so a simulated location of the modem's accuracy is the modem's fix reaching applications.
+	 */
 	if (self.ticks++ % 5 == 0) {
-		NSLog(@"gpscheck: %@modem %@; engine %u; %@; %u satellites, %u tracked, %u used; %u fixes%@; iOS location %@",
-		    self.demo ? @"DEMO " : @"", have ? state_name(g.state) : @"not there", g.engine_state,
-		    have ? session_name(g.session_status) : @"-", _count, tracked, used, g.fixes,
+		NSString *source = @"";
+
+		if (@available(iOS 15.0, *)) {
+			if (l != nil && l.sourceInformation != nil) {
+				source = l.sourceInformation.isSimulatedBySoftware ? @" (simulated)" : @" (not simulated)";
+			}
+		}
+		NSString *line = [NSString stringWithFormat:@"gpscheck: %@modem %@; engine %u; %@; %u satellites, %u tracked, "
+		    "%u used; %u fixes%@; iOS location %@%@", self.demo ? @"DEMO " : @"", have ? state_name(g.state) : @"not there",
+		    g.engine_state, have ? session_name(g.session_status) : @"-", _count, tracked, used, g.fixes,
 		    have && (g.valid & GNSS_V_ACCURACY) && (g.valid & GNSS_V_POSITION) ?
 		    [NSString stringWithFormat:@", accuracy %.0f m", f32(g.accuracy_bits)] : @"",
-		    l != nil ? [NSString stringWithFormat:@"±%.0f m", l.horizontalAccuracy] : @"none");
+		    l != nil ? [NSString stringWithFormat:@"±%.0f m, %.0f s old", l.horizontalAccuracy,
+		    -l.timestamp.timeIntervalSinceNow] : @"none", source];
+		NSLog(@"%@", line);
+		gps_log(line);
 	}
 }
 
