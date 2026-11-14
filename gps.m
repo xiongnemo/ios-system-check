@@ -9,6 +9,11 @@
 // the sysctl is not there and the tab says so). systemcheck://gps/run draws a DEMO sky (made-up satellites, labelled
 // as such) to check the drawing on a phone whose GNSS has none yet. Nothing here writes a position anywhere: the
 // console line ("gpscheck: ...") has the counts and the accuracy, never the coordinates.
+//
+// The screen does not show the position either, unless asked: screenshots and screen recordings of this tab are made
+// to be shown, and a position is where the phone is. The button over the sky goes round hidden (the default) /
+// about 10 km (0.1 degree) / exact, and is remembered (user default "gpsPosition"). Hidden and about-10-km give the
+// fix's age instead of its UTC time too: a sky of satellites with the exact time it was seen narrows down where.
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
 #include <fcntl.h>
@@ -271,10 +276,16 @@ struct sat {
 @property (strong) SkyView *sky;
 @property (strong) BarsView *bars;
 @property (strong) UILabel *label, *banner;
+@property (strong) UIButton *shownButton;
 @property (strong) NSTimer *timer;
 @property (assign) BOOL demo;
+@property (assign) NSInteger shown;        /* the position: 0 hidden, 1 about 10 km, 2 exact */
 @property (assign) unsigned ticks;
 @end
+
+#define POSITION_HIDDEN 0
+#define POSITION_ABOUT  1
+#define POSITION_EXACT  2
 
 static GpsController *g_gps;
 
@@ -320,6 +331,16 @@ gps_run(void)
 	self.label.numberOfLines = 0;
 	self.label.font = [UIFont monospacedSystemFontOfSize:10.5 weight:UIFontWeightRegular];
 	[self.view addSubview:self.label];
+	self.shown = MAX(POSITION_HIDDEN, MIN(POSITION_EXACT, [NSUserDefaults.standardUserDefaults integerForKey:@"gpsPosition"]));
+	self.shownButton = [UIButton buttonWithType:UIButtonTypeSystem];
+	self.shownButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+	self.shownButton.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.85];
+	self.shownButton.layer.cornerRadius = 13;
+	self.shownButton.contentEdgeInsets = UIEdgeInsetsMake(4, 10, 4, 10);
+	self.shownButton.imageEdgeInsets = UIEdgeInsetsMake(0, -4, 0, 4);
+	[self.shownButton addTarget:self action:@selector(nextShown) forControlEvents:UIControlEventTouchUpInside];
+	[self.view addSubview:self.shownButton];
+	[self showShown];
 	self.location = [CLLocationManager new];
 	self.location.delegate = self;
 	self.location.desiredAccuracy = kCLLocationAccuracyBest;
@@ -337,6 +358,39 @@ gps_run(void)
 	self.bars.frame = CGRectMake(8, CGRectGetMaxY(self.sky.frame) + 6, w - 16, 92);
 	self.label.frame = CGRectMake(14, CGRectGetMaxY(self.bars.frame) + 8, w - 28,
 	    all.size.height - safe.bottom - CGRectGetMaxY(self.bars.frame) - 12);
+	[self.shownButton sizeToFit];
+	CGSize b = self.shownButton.bounds.size;
+	self.shownButton.frame = CGRectMake(w - b.width - 8, top + 22, b.width, MAX(26, b.height));
+}
+
+/* the button: what is shown now, and a tap for the next */
+- (void)showShown
+{
+	static NSString *const titles[] = { @"Position hidden", @"Position ≈ 10 km", @"Position shown" };
+	static NSString *const images[] = { @"eye.slash", @"eye.circle", @"eye" };
+
+	[self.shownButton setTitle:titles[self.shown] forState:UIControlStateNormal];
+	[self.shownButton setImage:[UIImage systemImageNamed:images[self.shown]] forState:UIControlStateNormal];
+	[self.view setNeedsLayout];
+}
+
+- (void)nextShown
+{
+	self.shown = (self.shown + 1) % 3;
+	[NSUserDefaults.standardUserDefaults setInteger:self.shown forKey:@"gpsPosition"];
+	[self showShown];
+	[self tick];
+}
+
+/* a position as the button says */
+- (NSString *)where:(double)latitude :(double)longitude
+{
+	if (self.shown == POSITION_EXACT) {
+		return [NSString stringWithFormat:@"%.6f, %.6f", latitude, longitude];
+	} else if (self.shown == POSITION_ABOUT) {
+		return [NSString stringWithFormat:@"about %.1f, %.1f", latitude, longitude];
+	}
+	return @"(position hidden)";
 }
 
 - (void)viewWillAppear:(BOOL)animated
@@ -488,7 +542,7 @@ session_name(uint32_t s)
 		[t appendFormat:@"\n  reports %u, fixes %u%@\n", g.reports, g.fixes, g.opmode == 3 ? @", modem OFFLINE" :
 		    g.opmode == 0 ? @", modem online" : g.opmode == 1 ? @", modem low power" : @""];
 		if (fix) {
-			[t appendFormat:@"  %.6f, %.6f", f64(g.latitude_bits), f64(g.longitude_bits)];
+			[t appendFormat:@"  %@", [self where:f64(g.latitude_bits) :f64(g.longitude_bits)]];
 			if (g.valid & GNSS_V_ACCURACY) {
 				[t appendFormat:@"  ±%.0f m", f32(g.accuracy_bits)];
 			}
@@ -505,12 +559,14 @@ session_name(uint32_t s)
 				[t appendFormat:@"  speed %.1f km/h, heading %.0f°\n", (g.valid & GNSS_V_SPEED) ? f32(g.speed_bits) * 3.6 : 0.0,
 				    (g.valid & GNSS_V_HEADING) ? f32(g.heading_bits) : 0.0];
 			}
-			if (g.valid & GNSS_V_UTC) {
+			if ((g.valid & GNSS_V_UTC) && self.shown == POSITION_EXACT) {
 				NSDateFormatter *f = [NSDateFormatter new];
 
 				f.dateFormat = @"HH:mm:ss 'UTC'";
 				f.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
 				[t appendFormat:@"  time of fix %@\n", [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:g.utc_ms / 1000.0]]];
+			} else if (g.valid & GNSS_V_UTC) {
+				[t appendFormat:@"  fix %.0f s old\n", MAX(0.0, NSDate.date.timeIntervalSince1970 - g.utc_ms / 1000.0)];
 			}
 		} else {
 			[t appendString:@"  no position yet\n"];
@@ -527,7 +583,7 @@ session_name(uint32_t s)
 	} else if (l == nil) {
 		[t appendString:@"  no location yet\n"];
 	} else {
-		[t appendFormat:@"  %.6f, %.6f  ±%.0f m, %.0f s ago\n", l.coordinate.latitude, l.coordinate.longitude,
+		[t appendFormat:@"  %@  ±%.0f m, %.0f s ago\n", [self where:l.coordinate.latitude :l.coordinate.longitude],
 		    l.horizontalAccuracy, -l.timestamp.timeIntervalSinceNow];
 		if (l.verticalAccuracy >= 0) {
 			[t appendFormat:@"  altitude %.0f m ±%.0f\n", l.altitude, l.verticalAccuracy];
