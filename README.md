@@ -31,7 +31,7 @@
   SpriteKit、SceneKit 在这个进程里就定在 OpenGL ES 上了，Metal 页的 `metal.spritekit`、`metal.scenekit` 记 SKIP。
   要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
 
-- 包名：`com.anzupop.com.ios.systemcheck`
+- 包名：`com.anzupop.ios.systemcheck`
 - 最低 iOS 15.0，iPhone，竖屏
 - 只用 Objective-C 和系统框架；每个标签页一个 `.m` 文件，没有 storyboard、asset catalog
 - 链接 OpenGLES（移植只给主程序链接了 OpenGLES 的应用 GL），Metal、MetalKit、SpriteKit、SceneKit、MetalPerformanceShaders、Photos 弱链接
