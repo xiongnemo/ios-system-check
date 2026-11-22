@@ -25,7 +25,7 @@
   而 `spritekit.view` 会 FAIL：SpriteKit 看到有 Metal 设备就改走 Metal，它的 Metal 渲染器在移植上抛异常
   （`-[NSURL initFileURLWithPath:]` 拿到 nil）。要看普通应用在移植上拿到的结果，就关掉 App 重开、先跑 GPU 页。
 
-- 包名：`com.anzupop.com.ios.systemcheck`
+- 包名：`com.anzupop.ios.systemcheck`
 - 最低 iOS 15.0，iPhone，竖屏
 - 只用 Objective-C 和系统框架；每个标签页一个 `.m` 文件，没有 storyboard、asset catalog
 - 链接 OpenGLES（移植只给主程序链接了 OpenGLES 的应用 GL），Metal、SpriteKit、SceneKit 弱链接

@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>SystemCheck</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.anzupop.com.ios.systemcheck</string>
+	<string>com.anzupop.ios.systemcheck</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -38,7 +38,7 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.anzupop.com.ios.systemcheck</string>
+			<string>com.anzupop.ios.systemcheck</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>systemcheck</string>
